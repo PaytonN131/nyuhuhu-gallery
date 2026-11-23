@@ -27,6 +27,16 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Windows 10/11 provide their own UCRT and ICU runtime. Copies collected
+# from the build machine can shadow the system DLLs when Qt loads.
+system_dlls = {'ucrtbase.dll', 'icudt78.dll', 'icuuc.dll'}
+a.binaries = [
+    entry for entry in a.binaries
+    if not (
+        Path(entry[0]).name.lower() in system_dlls
+        or Path(entry[0]).name.lower().startswith('api-ms-win-')
+    )
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(
