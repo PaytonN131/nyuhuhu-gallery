@@ -16,6 +16,7 @@ import html
 import json
 import datetime
 import threading
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,14 +28,16 @@ from PIL import Image
 from PySide6.QtCore import (
     Qt, QSize, QRectF, QPointF, QPoint, QRect, Signal, QTimer, QUrl, QVariantAnimation,
     QEasingCurve, QEvent, QPropertyAnimation, QMimeData, QObject, QDate,
-    QRunnable, QThreadPool, QEventLoop, QProcess, QTemporaryDir,
+    QRunnable, QThreadPool, QEventLoop, QProcess,
     qInstallMessageHandler, QtMsgType
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QImageReader, QKeySequence, QShortcut, QPainter, QColor,
     QPainterPath, QFont, QIcon, QLinearGradient, QRadialGradient, QBrush,
-    QPen, QFontDatabase, QFontMetrics, QPolygonF, QCursor, QDrag, QPalette, QIntValidator
+    QPen, QFontDatabase, QFontMetrics, QPolygonF, QCursor, QDrag, QPalette, QIntValidator, QDesktopServices
 )
+from PySide6.QtPdf import QPdfDocument
+from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -138,6 +141,7 @@ class Tema:
     panel_op = 85
     ratio_tarjeta = 138
     titulo = "✿ NYUHUHU GALLERY"
+    titulo_biblioteca = "Mi biblioteca"
     particulas = "Pétalos"
     cantidad = 24
     vel = 100
@@ -168,6 +172,7 @@ class Tema:
 
 
 AJUSTES = {
+    "titulo_biblioteca": "titulo_biblioteca",
     "tema": "nombre", "acento": "acento", "fuente": "fuente", "tam": "tam",
     "radio": "radio", "anim": "anim", "fondo": "fondo",
     "fondo_vis": "fondo_vis", "cabecera": "cabecera", "mascota": "mascota",
@@ -243,6 +248,7 @@ QTabWidget::pane {{
     border: 1px solid {c('border')}; border-radius: {r}px;
     background: {c('panel')}; top: -1px;
 }}
+QFrame#barraBiblioteca {{ background: {c('panel')}; border: 1px solid {c('border')}; border-radius: {r}px; }}
 QTabBar {{ background: transparent; }}
 QTabBar::tab {{
     background: transparent; color: {c('muted')}; padding: 9px 16px;
@@ -347,6 +353,34 @@ def conectar():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre TEXT NOT NULL UNIQUE
         )""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ficha_novela (
+            juego_id INTEGER PRIMARY KEY REFERENCES juegos(id) ON DELETE CASCADE,
+            lanzamiento TEXT NOT NULL DEFAULT '',
+            vndb TEXT NOT NULL DEFAULT '',
+            guia TEXT NOT NULL DEFAULT ''
+        )""")
+    ficha_columnas = {f[1] for f in conn.execute("PRAGMA table_info(ficha_novela)")}
+    for columna in ("lanzamiento_steam", "desarrolladora"):
+        if columna not in ficha_columnas:
+            conn.execute(f"ALTER TABLE ficha_novela ADD COLUMN {columna} TEXT NOT NULL DEFAULT ''")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS clips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            juego_id INTEGER NOT NULL REFERENCES juegos(id) ON DELETE CASCADE,
+            titulo TEXT NOT NULL,
+            ruta TEXT NOT NULL
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_clips_juego ON clips(juego_id, id)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS voces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            juego_id INTEGER NOT NULL REFERENCES juegos(id) ON DELETE CASCADE,
+            heroina_id INTEGER REFERENCES heroinas(id) ON DELETE SET NULL,
+            titulo TEXT NOT NULL,
+            ruta TEXT NOT NULL
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_voces_juego ON voces(juego_id, id)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS imagenes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -872,14 +906,18 @@ class CacheImagenes:
         self.limite = limite
         self.limite_bytes = limite_mb * 1024 * 1024
         self.datos = OrderedDict()
+        self._bytes = 0
 
-    def _recortar(self):
-        """Libera las imágenes más antiguas si hay demasiadas o ocupan demasiada memoria."""
-        total = sum(pm.width() * pm.height() * 4 for pm in self.datos.values())
+    def _guardar(self, clave, pm):
+        previo = self.datos.pop(clave, None)
+        if previo is not None:
+            self._bytes -= previo.width() * previo.height() * 4
+        self.datos[clave] = pm
+        self._bytes += pm.width() * pm.height() * 4
         while len(self.datos) > 1 and (len(self.datos) > self.limite
-                                        or total > self.limite_bytes):
+                                        or self._bytes > self.limite_bytes):
             _, viejo = self.datos.popitem(last=False)
-            total -= viejo.width() * viejo.height() * 4
+            self._bytes -= viejo.width() * viejo.height() * 4
 
     def obtener(self, ruta, lado):
         if not ruta:
@@ -892,8 +930,7 @@ class CacheImagenes:
         img = leer_imagen_escalada(ruta, lado)
         pm = QPixmap.fromImage(img) if not img.isNull() else QPixmap()
 
-        self.datos[clave] = pm
-        self._recortar()
+        self._guardar(clave, pm)
         return pm
 
     # ---- carga en segundo plano: el dibujo nunca espera al disco
@@ -909,6 +946,7 @@ class CacheImagenes:
             return pm
         if not hasattr(self, "_pend"):
             self._pend = {}
+            self._espera = set()
             self._senal = _SenalCarga()
             self._senal.listo.connect(self._recibir)
             self._pool = QThreadPool()
@@ -918,6 +956,10 @@ class CacheImagenes:
             if widget is not None:
                 avisar.add(widget)
             return QPixmap()
+        if len(self._pend) >= 32:
+            if widget is not None:
+                self._espera.add(widget)
+            return QPixmap()
         self._pend[clave] = {widget} if widget is not None else set()
         self._pool.start(_TareaCarga(str(ruta), lado, self._senal))
         return QPixmap()
@@ -925,11 +967,14 @@ class CacheImagenes:
     def _recibir(self, ruta, lado, img):
         clave = (ruta, lado)
         avisar = self._pend.pop(clave, set())
-        self.datos[clave] = QPixmap.fromImage(img) if not img.isNull() else QPixmap()
-        self._recortar()
+        self._guardar(clave, QPixmap.fromImage(img) if not img.isNull() else QPixmap())
+        if self._espera:
+            avisar.update(self._espera)
+            self._espera.clear()
         for w in avisar:
             try:
-                w.update()
+                if w.isVisible():
+                    w.update()
             except RuntimeError:                    # el widget ya no existe
                 pass
 
@@ -1255,6 +1300,47 @@ class BotonAnimado(QPushButton):
         p.drawRoundedRect(r, radio, radio)
         p.setPen(txt)
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
+
+
+class AccesoBiblioteca(BotonAnimado):
+    """Acceso compacto con icono y contorno derivados de la paleta activa."""
+
+    def __init__(self, titulo, simbolo):
+        super().__init__(titulo)
+        self.simbolo = simbolo
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        return QSize(fm.horizontalAdvance(self.text()) + 38, max(34, fm.height() + 14))
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = QRectF(self.rect()).adjusted(1, 2, -1, -2)
+            a1 = QColor(Tema.a1())
+            base = QColor(Tema.c("input"))
+            activo = self.isDown() or self.underMouse() or self.hasFocus()
+            color = mezclar(base, a1, 0.19 if self.isDown() else 0.12 if activo else 0.035)
+            borde = mezclar(QColor(Tema.c("border")), a1, 0.65 if activo else 0.18)
+            p.setPen(QPen(borde, 1.0))
+            p.setBrush(color)
+            radio = min(Tema.radio, r.height() / 2)
+            p.drawRoundedRect(r, radio, radio)
+
+            icono = QFont("Segoe UI Symbol")
+            icono.setPixelSize(16)
+            p.setFont(icono)
+            tinte = mezclar(QColor(Tema.c("text")), a1, 0.72)
+            p.setPen(tinte)
+            area_icono = QRectF(r.left() + 6, r.top(), 19, r.height())
+            p.drawText(area_icono, Qt.AlignmentFlag.AlignCenter, self.simbolo)
+            p.setFont(self.font())
+            p.setPen(QColor(Tema.c("text")))
+            p.drawText(r.adjusted(28, 0, -4, 0),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+        finally:
+            p.end()
 
 
 class BotonRedondo(BotonAnimado):
@@ -1652,15 +1738,18 @@ class GridTarjetas(QWidget):
         self._off = QPoint()
 
     def poner(self, widgets):
+        if self.items == widgets:
+            return
         self._arr = None
         self._ins = None
-        for w in self.items:
-            w.setParent(None)
-            w.deleteLater()
+        for w in set(self.items) - set(widgets):
+            w.hide()
         self.items = widgets
         for w in widgets:
-            w.setParent(self)
-            if hasattr(w, "arrastre"):
+            nuevo = w.parent() is not self
+            if nuevo:
+                w.setParent(self)
+            if nuevo and hasattr(w, "arrastre"):
                 w.arrastre.connect(self._al_arrastrar)
                 w.soltado.connect(self._al_soltar)
             w.show()
@@ -2088,29 +2177,7 @@ class FondoWidget(QWidget):
 
 
 class Cabecera(QFrame):
-    """Banner superior con imagen personalizable."""
-
-    def __init__(self):
-        super().__init__()
-        self.setFixedHeight(Tema.alto_cabecera)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(22, 4, 14, 4)
-        col = QVBoxLayout()
-        col.setSpacing(0)
-        col.addStretch()
-        logo = QLabel(Tema.titulo)
-        logo.setObjectName("logo")
-        self.logo = logo
-        sub = QLabel("Biblioteca de capturas de novelas visuales")
-        sub.setObjectName("muted")
-        self.sub = sub
-        col.addWidget(logo)
-        col.addWidget(sub)
-        col.addStretch()
-        lay.addLayout(col, 1)
-        self.botones = QHBoxLayout()
-        self.botones.setSpacing(8)
-        lay.addLayout(self.botones)
+    """Fondo temático de la barra de la biblioteca."""
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -2126,8 +2193,10 @@ class Cabecera(QFrame):
         g.setColorAt(0, con_alfa(Tema.a1(), 120))
         g.setColorAt(1, con_alfa(Tema.a2(), 120))
         p.fillRect(r, QBrush(g))
-        if Tema.cabecera and Path(Tema.cabecera).exists():
-            dibujar_cover(p, r, CACHE_GRANDE.obtener(Tema.cabecera, 1800), 0)
+        if Tema.cabecera:
+            banner = CACHE_GRANDE.obtener_diferido(Tema.cabecera, 1500, self)
+            if not banner.isNull():
+                dibujar_cover(p, r, banner, 0)
         vel = QLinearGradient(r.topLeft(), r.topRight())
         vel.setColorAt(0, con_alfa(Tema.c("bg"), 235))
         vel.setColorAt(0.55, con_alfa(Tema.c("bg"), 110))
@@ -2137,6 +2206,7 @@ class Cabecera(QFrame):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(QColor(Tema.c("border")), 1.2))
         p.drawPath(camino)
+        p.end()
 
 
 # =========================================================
@@ -2189,13 +2259,13 @@ class DelegadoMiniatura(QStyledItemDelegate):
         camino.addRoundedRect(r, radio, radio)
 
         # sombra suave + resplandor de acento
-        for i in (7, 5, 3, 1):                         # 4 capas en vez de 7: más rápido al desplazarse
+        for i in (5, 2):
             sh = QPainterPath()
             sh.addRoundedRect(r.adjusted(-i, -i + 4, i, i + 4), radio + i, radio + i)
             p.fillPath(sh, QColor(0, 0, 0, int(8 + 5 * h)))
         brillo = max(h, 0.7 if sel else 0.0)
         if brillo > 0.02:
-            for i in range(10, 0, -2):
+            for i in (6, 3):
                 gl = QPainterPath()
                 gl.addRoundedRect(r.adjusted(-i, -i, i, i), radio + i, radio + i)
                 col = QColor(ca)
@@ -2304,6 +2374,8 @@ class ListaGaleria(QListWidget):
         self.setWrapping(True)
         self.setSpacing(0)
         self.setUniformItemSizes(True)
+        self.setLayoutMode(QListWidget.LayoutMode.Batched)
+        self.setBatchSize(100)
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -2522,7 +2594,13 @@ class ListaGaleria(QListWidget):
                 self._entrada_activa = False
             else:
                 activo = True
-        self.viewport().update()
+        if self._entrada_activa:
+            self.viewport().update()
+        else:
+            for fila in filas:
+                indice = self.model().index(fila, 0)
+                if indice.isValid():
+                    self.viewport().update(self.visualRect(indice))
         if not activo:
             self._anim.stop()
 
@@ -3876,7 +3954,7 @@ class TopHeroinas(QWidget):
     def poner(self, items):
         self.items = {i["id"]: i for i in items}
         self.orden = [i["id"] for i in items]
-        self.av = {i["id"]: avatar(i["foto"], 128, i["enc"]) for i in items}
+        self.av = {}
         self._max = max([i["capturas"] for i in items] + [1])
         self._total = max(sum(i["capturas"] for i in items), 1)
         for i in items:
@@ -4188,6 +4266,11 @@ class TopHeroinas(QWidget):
 
     def _avatar(self, p, hid, centro, rad):
         pm = self.av.get(hid)
+        if pm is None and hid in self.items:
+            datos = self.items[hid]
+            pm, listo = avatar_listo(datos["foto"], 128, datos["enc"], self)
+            if listo:
+                self.av[hid] = pm
         if pm is not None and not pm.isNull():
             p.drawPixmap(QRectF(centro.x() - rad, centro.y() - rad, rad * 2, rad * 2),
                          pm, QRectF(pm.rect()))
@@ -14080,14 +14163,19 @@ class DialogoAjustes(QDialog):
         f.addRow(self._fila_imagen("Imagen de fondo", "fondo"))
         f.addRow("Visibilidad del fondo:", slider((0, 100), Tema.fondo_vis, "fondo_vis"))
         f.addRow(self._fila_imagen("Banner superior", "cabecera"))
-        f.addRow("Alto del banner:", slider((44, 180), Tema.alto_cabecera, "alto_cabecera"))
         f.addRow(self._fila_imagen("Personaje decorativo", "mascota"))
 
         # --- interfaz
         f = pagina("🧩 Interfaz")
-        t = QLineEdit(Tema.titulo)
-        t.textChanged.connect(lambda v: main.cambiar_ajuste("titulo", v))
-        f.addRow("Título de la cabecera:", t)
+        titulo = QLineEdit(Tema.titulo_biblioteca)
+        titulo.setMaxLength(65)
+        titulo.setPlaceholderText("Mi biblioteca")
+        titulo.editingFinished.connect(
+            lambda: main.cambiar_ajuste("titulo_biblioteca", titulo.text().strip() or "Mi biblioteca"))
+        f.addRow("Título de la biblioteca", titulo)
+        carpeta = BotonAnimado("📁 Abrir carpeta de la biblioteca")
+        carpeta.clicked.connect(lambda: os.startfile(str(ROOT)))
+        f.addRow(carpeta)
         f.addRow("Forma de las tarjetas:", slider((100, 190), Tema.ratio_tarjeta, "ratio_tarjeta"))
 
         # --- efectos
@@ -14195,9 +14283,9 @@ class DelegadoPersonaje(QStyledItemDelegate):
             txt = QColor(Tema.c("text"))
         lado = r.height() - 14
         av = QRectF(r.left() + 10, r.top() + 7, lado, lado)
-        ic = index.data(Qt.ItemDataRole.DecorationRole)
-        if isinstance(ic, QIcon) and not ic.isNull():
-            pm = ic.pixmap(QSize(52, 52))
+        datos = index.data(Qt.ItemDataRole.UserRole) or {}
+        pm, _ = avatar_listo(datos.get("foto"), 52, datos.get("enc"), option.widget.viewport())
+        if pm is not None and not pm.isNull():
             p.drawPixmap(av, pm, QRectF(pm.rect()))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(QColor(255, 255, 255, 215) if sel else con_alfa(a1, 200), 2))
@@ -14826,7 +14914,7 @@ class VideoPantalla(QVideoWidget):
         e.ignore()                                    # lo atiende ReproductorOpening
 
 
-TXT_REPOSO = "🎬\n\nPulsa ▶ para ver el opening"
+TXT_REPOSO = "🎬\n\nHaz clic para reproducir"
 
 
 class PantallaReposo(QLabel):
@@ -14907,7 +14995,6 @@ class ReproductorOpening(QWidget):
         self._marco = None
         self._ph = None
         self._tamanos = None
-        self._esc = None
         self._ventana_full_previa = False
         self._ventana_max = False
         self._ult_pos = QPoint()
@@ -15068,8 +15155,6 @@ class ReproductorOpening(QWidget):
         self._capa.raise_()
         self.show()
         self.b_full.setToolTip("Salir de pantalla completa (Esc)")
-        self._esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), ventana)
-        self._esc.activated.connect(self.salir_completa)
         self.video.setFocus()
         self._mostrar_controles(True)
 
@@ -15080,10 +15165,6 @@ class ReproductorOpening(QWidget):
         self._t_ocultar.stop()
         self.barra.setVisible(True)
         self.video.unsetCursor()
-        if self._esc is not None:
-            self._esc.setEnabled(False)
-            self._esc.deleteLater()
-            self._esc = None
         capa, ph, ventana = self._capa, self._ph, self._capa.parentWidget()
         capa.layout().removeWidget(self)
         tipo, cont = self._marco
@@ -15414,9 +15495,59 @@ class ReproductorOpening(QWidget):
             self.pantalla.setCurrentIndex(0)
 
 
+class DelegadoCatalogoOpening(QStyledItemDelegate):
+    def sizeHint(self, opcion, indice):
+        return QSize(180, max(75, opcion.fontMetrics.height() * 2 + 18))
+
+    def paint(self, p, opcion, indice):
+        datos = indice.data(Qt.ItemDataRole.UserRole + 1)
+        if not datos:
+            return
+        p.save()
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = QRectF(opcion.rect).adjusted(3, 3, -3, -2)
+            sel = bool(opcion.state & QStyle.StateFlag.State_Selected)
+            a1 = QColor(Tema.a1())
+            fondo = QColor(Tema.c("input"))
+            p.setBrush(mezclar(fondo, a1, 0.21 if sel else 0.03))
+            p.setPen(QPen(mezclar(QColor(Tema.c("border")), a1, 0.62 if sel else 0.1), 1))
+            p.drawRoundedRect(r, 9, 9)
+            poster = QRectF(r.x() + 6, r.y() + 5, 43, r.height() - 10)
+            vista = opcion.widget.viewport() if opcion.widget is not None else None
+            portada = CACHE_GRANDE.obtener_diferido(datos.get("portada"), 160, vista)
+            if portada.isNull():
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(mezclar(fondo, a1, 0.19))
+                p.drawRoundedRect(poster, 6, 6)
+                p.setPen(QColor(Tema.c("muted")))
+                p.drawText(poster, Qt.AlignmentFlag.AlignCenter, "▷")
+            else:
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                dibujar_cover(p, poster, portada, 6, datos.get("enc"))
+            titulo = QFont(opcion.font)
+            titulo.setBold(True)
+            alto = r.height() / 2
+            x = poster.right() + 10
+            ancho = max(0, r.right() - x - 28)
+            texto_el(p, x, r.y() + 2, ancho, alto, datos["titulo"],
+                     titulo, QColor(Tema.c("text")))
+            texto_el(p, x, r.center().y(), ancho, alto - 2, datos["novela"],
+                     opcion.font, QColor(Tema.c("muted")))
+            p.setPen(a1)
+            p.drawText(r.adjusted(0, 0, -10, 0),
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                       "♥" if datos["favorito"] else "▷")
+        finally:
+            p.restore()
+
+
 class NyuhuhuGallery(QMainWindow):
     IDX_OPENINGS = 2          # pestañas de una novela: Galería · Música · Openings · Top
     IDX_TOP = 3
+    IDX_FICHA = 4
+    IDX_CLIPS = 5
+    IDX_VOCES = 6
     PAG_OPENINGS = 6          # página «Openings» del panel principal
 
     def __init__(self):
@@ -15430,6 +15561,9 @@ class NyuhuhuGallery(QMainWindow):
         self.heroina_id = self.heroina_nombre = None
         self.tamano = 260
         self.cargando = False
+        self._galeria_id = None
+        self.clips_reproductor = None
+        self.voces_player = None
         self.cola, self.cola_idx, self.repetir = [], -1, 0
         self._pendientes = {}
         self._estilo_cache = None
@@ -15454,6 +15588,8 @@ class NyuhuhuGallery(QMainWindow):
         QApplication.instance().installEventFilter(self)
         self._iniciar_nav()
         self._iniciar_vigilante_audio()
+        self._encolar_biblioteca_mp3()
+        self._timer_mp3.start(1200)
 
     # -----------------------------------------------------
     # TEMA Y AJUSTES
@@ -15466,14 +15602,12 @@ class NyuhuhuGallery(QMainWindow):
         if estilo != self._estilo_cache:
             self._estilo_cache = estilo
             app.setStyleSheet(estilo)
-        self.cabecera.setFixedHeight(Tema.alto_cabecera)
-        self.cabecera.sub.setVisible(Tema.alto_cabecera >= 76)    # con la cabecera baja, solo el logo
-        self.cabecera.logo.setText(Tema.titulo)
+        self.titulo_bib.setText(Tema.titulo_biblioteca or "Mi biblioteca")
+        self.titulo_bib.setToolTip(self.titulo_bib.text())
         self.grid_juegos.ratio = Tema.ratio_tarjeta / 100
         self.grid_juegos.relayout()
         for b in self.findChildren(BotonAnimado):
             b.updateGeometry()
-        self.btn_tema.setText("☀ Claro" if Tema.nombre == "Oscuro" else "☾ Oscuro")
         self.fondo.reiniciar_particulas()
         for w in self.findChildren(QWidget):
             w.update()
@@ -15481,6 +15615,12 @@ class NyuhuhuGallery(QMainWindow):
         self.refrescar_info_heroina(self.heroina_actual_datos())
 
     def cambiar_ajuste(self, clave, valor):
+        if clave == "titulo_biblioteca":
+            Tema.titulo_biblioteca = valor
+            self.titulo_bib.setText(valor)
+            self.titulo_bib.setToolTip(valor)
+            guardar_ajuste(self.conn, clave, valor)
+            return
         if clave == "anim":
             valor = False
         setattr(Tema, AJUSTES[clave], valor)
@@ -15500,24 +15640,6 @@ class NyuhuhuGallery(QMainWindow):
         dlg = DialogoAjustes(self)
         dlg.tabs.setCurrentIndex(pestana)
         dlg.exec()
-
-    def menu_fuentes(self, boton):
-        instaladas = set(QFontDatabase.families())
-        curadas = [f for f in ("Segoe UI", "Yu Gothic UI", "Meiryo UI", "Comic Sans MS",
-                               "Trebuchet MS", "Verdana", "Georgia", "Calibri", "Candara",
-                               "Cambria", "Segoe Print", "Ink Free", "Bahnschrift",
-                               "Consolas") if f in instaladas]
-        m = QMenu(self)
-        for fam in curadas:
-            a = m.addAction(fam)
-            a.setFont(QFont(fam, Tema.tam + 1))
-            a.setCheckable(True)
-            a.setChecked(fam == Tema.fuente)
-            a.triggered.connect(lambda _=False, fam=fam: self.cambiar_ajuste("fuente", fam))
-        m.addSeparator()
-        mas = m.addAction("Todas las fuentes…")
-        mas.triggered.connect(lambda: self.abrir_ajustes(1))
-        m.exec(boton.mapToGlobal(boton.rect().bottomLeft()))
 
     def toast(self, texto, ms=3400):
         self.toast_w.mostrar(texto, ms)
@@ -15544,7 +15666,10 @@ class NyuhuhuGallery(QMainWindow):
     def _al_cambiar_pagina(self, i):
         """Dentro de una novela (página 1) la cabecera se esconde para dar espacio al opening;
         al salir, el video se detiene."""
-        self.cabecera.setVisible(i != 1)
+        if i != 1:
+            self.guia_pdf.close()
+            self._detener_clips()
+            self._detener_voces()
         if i != 1 and hasattr(self, "opening"):
             self.opening.detener()
         if i != self.PAG_OPENINGS and hasattr(self, "opening_global"):
@@ -15573,6 +15698,16 @@ class NyuhuhuGallery(QMainWindow):
 
     def eventFilter(self, obj, ev):
         t = ev.type()
+        if (t in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress)
+                and ev.key() == Qt.Key.Key_Escape
+                and isinstance(obj, QWidget) and obj.window() is self
+                and QApplication.activeModalWidget() is None
+                and QApplication.activePopupWidget() is None
+                and self._opening_activo() is not None):
+            ev.accept()
+            if t == QEvent.Type.KeyPress and not ev.isAutoRepeat():
+                self._salir_del_opening()
+            return True
         if t == QEvent.Type.MouseButtonPress or t == QEvent.Type.MouseButtonRelease:
             try:
                 b = ev.button()
@@ -15597,6 +15732,37 @@ class NyuhuhuGallery(QMainWindow):
             except Exception:
                 pass
         return False
+
+    def _opening_activo(self):
+        if self.pila.currentIndex() == self.PAG_OPENINGS:
+            return self.opening_global
+        if self.pila.currentIndex() == 1:
+            pestaña = self.tabs_juego.currentIndex()
+            if pestaña == self.IDX_OPENINGS:
+                return self.opening
+            if pestaña == self.IDX_CLIPS:
+                return self.clips_reproductor
+        return None
+
+    def _salir_del_opening(self):
+        reproductor = self._opening_activo()
+        if reproductor is None:
+            return
+        if reproductor.en_completa():
+            reproductor.salir_completa()
+            reproductor.video.setFocus()
+        elif not reproductor.player.source().isEmpty():
+            reproductor.soltar()
+            if reproductor is self.opening_global:
+                self.lista_op_todos.setFocus()
+            elif reproductor is self.clips_reproductor:
+                self.lista_clips.setFocus()
+            else:
+                self.lista_openings.setFocus()
+        elif reproductor is self.opening_global:
+            self.volver_biblioteca()
+        else:
+            self.tabs_juego.setCurrentIndex(0)
 
     def _explosion_clic(self, glob):
         try:
@@ -15707,7 +15873,8 @@ class NyuhuhuGallery(QMainWindow):
                 QTimer.singleShot(0, f)
                 return True
             return False
-        for rp in (getattr(self, "opening", None), getattr(self, "opening_global", None)):
+        for rp in (getattr(self, "opening", None), getattr(self, "opening_global", None),
+                       self.clips_reproductor):
             if rp is not None and rp.en_completa():
                 if atras:
                     QTimer.singleShot(0, rp.salir_completa)
@@ -15761,7 +15928,10 @@ class NyuhuhuGallery(QMainWindow):
             if dev.isNull():
                 return
             motores = [(self.audio, self.player)]
-            for rp in (getattr(self, "opening", None), getattr(self, "opening_global", None)):
+            if self.voces_player is not None:
+                motores.append((self.voces_audio, self.voces_player))
+            for rp in (getattr(self, "opening", None), getattr(self, "opening_global", None),
+                       self.clips_reproductor):
                 if rp is not None:
                     motores.append((rp.audio, rp.player))
             for audio, player in motores:
@@ -15795,19 +15965,6 @@ class NyuhuhuGallery(QMainWindow):
         raiz.setContentsMargins(14, 8, 14, 8)
         raiz.setSpacing(8)
 
-        self.cabecera = Cabecera()
-        self.btn_tema = BotonAnimado("☀ Claro")
-        self.btn_tema.clicked.connect(self.alternar_tema)
-        btn_aj = BotonAnimado("⚙ Personalizar")
-        btn_aj.clicked.connect(self.abrir_ajustes)
-        btn_dir = BotonAnimado("📁 Carpeta")
-        btn_dir.clicked.connect(lambda: os.startfile(str(ROOT)))
-        btn_fuente = BotonAnimado("Aa ▾")
-        btn_fuente.clicked.connect(lambda: self.menu_fuentes(btn_fuente))
-        for b in (btn_dir, btn_fuente, self.btn_tema, btn_aj):
-            self.cabecera.botones.addWidget(b)
-        raiz.addWidget(self.cabecera)
-
         self.pila = QStackedWidget()
         self.pila.addWidget(self.construir_biblioteca())
         self.pila.addWidget(self.construir_juego())
@@ -15836,33 +15993,38 @@ class NyuhuhuGallery(QMainWindow):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
+        panel = Cabecera()
+        barra = QVBoxLayout(panel)
+        barra.setContentsMargins(12, 7, 12, 7)
+        barra.setSpacing(6)
         fila = QHBoxLayout()
+        herramientas = QHBoxLayout()
         col = QVBoxLayout()
-        t = QLabel("Mis novelas visuales ♡")
-        t.setObjectName("heading")
+        col.setSpacing(0)
+        self.titulo_bib = QLabel()
+        self.titulo_bib.setObjectName("heading")
+        self.titulo_bib.setWordWrap(True)
+        self.titulo_bib.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_bib = QLabel("")
         self.lbl_bib.setObjectName("muted")
-        col.addWidget(t)
+        col.addWidget(self.titulo_bib)
         col.addWidget(self.lbl_bib)
         fila.addLayout(col, 1)
-        self.b_favs = BotonAnimado("★ Capturas Favoritas", primario=True)
-        self.b_favs.clicked.connect(self.abrir_favoritos)
-        fila.addWidget(self.b_favs)
-        self.b_hall = BotonAnimado("👑 Heroínas de heroínas", primario=True)
-        self.b_hall.clicked.connect(self.abrir_hall)
-        fila.addWidget(self.b_hall)
-        self.b_info = BotonAnimado("🎂 Info heroínas", primario=True)
-        self.b_info.clicked.connect(self.abrir_info_heroinas)
-        fila.addWidget(self.b_info)
-        self.b_crono = BotonAnimado("⏳ Cronología", primario=True)
-        self.b_crono.setToolTip("Tus novelas en una línea de tiempo, con horas, ritmo y récords")
-        self.b_crono.clicked.connect(self.abrir_cronologia)
-        fila.addWidget(self.b_crono)
-        self.b_openings = BotonAnimado("🎬 Openings", primario=True)
-        self.b_openings.setToolTip("Todos tus openings: elige los que te gustan y "
-                                   "reprodúcelos en el orden que quieras")
-        self.b_openings.clicked.connect(self.abrir_openings)
-        fila.addWidget(self.b_openings)
+        accesos = QHBoxLayout()
+        accesos.setSpacing(5)
+        for titulo, simbolo, accion in (
+            ("Favoritas", "♡", self.abrir_favoritos),
+            ("Ranking", "♕", self.abrir_hall),
+            ("Personajes", "♙", self.abrir_info_heroinas),
+            ("Cronología", "▤", self.abrir_cronologia),
+            ("Openings", "▷", self.abrir_openings),
+            ("Personalizar", "✎", self.abrir_ajustes),
+        ):
+            boton = AccesoBiblioteca(titulo, simbolo)
+            boton.clicked.connect(accion)
+            accesos.addWidget(boton)
+        fila.addLayout(accesos)
         self.orden_bib = QComboBox()
         self.orden_bib.addItems(ORDENES_BIB)
         self.orden_bib.setToolTip("Ordenar las novelas")
@@ -15884,9 +16046,9 @@ class NyuhuhuGallery(QMainWindow):
         b_azar = BotonAnimado("🎲 Al azar")
         b_azar.setToolTip("Abre una novela cualquiera de las que se ven ahora")
         b_azar.clicked.connect(self.novela_al_azar)
-        fila.addWidget(b_azar)
-        fila.addWidget(self.orden_bib)
-        fila.addWidget(self.filtro_bib)
+        herramientas.addWidget(b_azar)
+        herramientas.addWidget(self.orden_bib)
+        herramientas.addWidget(self.filtro_bib)
         self.buscar_juego = QLineEdit()
         self.buscar_juego.setPlaceholderText("⌕  Buscar novela...")
         self.buscar_juego.setMinimumWidth(170)
@@ -15895,15 +16057,17 @@ class NyuhuhuGallery(QMainWindow):
         self._t_busq_bib.setInterval(180)
         self._t_busq_bib.timeout.connect(self.cargar_biblioteca)
         self.buscar_juego.textChanged.connect(lambda *_: self._t_busq_bib.start())
-        fila.addWidget(self.buscar_juego)
-        fila.addWidget(QLabel("Tarjetas"))
+        herramientas.insertWidget(0, self.buscar_juego, 1)
+        herramientas.addWidget(QLabel("Tarjetas"))
         sl = QSlider(Qt.Orientation.Horizontal)
         sl.setRange(150, 380)
         sl.setValue(220)
-        sl.setMaximumWidth(150)
+        sl.setMaximumWidth(96)
         sl.valueChanged.connect(self.cambiar_tamano_tarjetas)
-        fila.addWidget(sl)
-        v.addLayout(fila)
+        herramientas.addWidget(sl)
+        barra.addLayout(fila)
+        barra.addLayout(herramientas)
+        v.addWidget(panel)
 
         self.scroll_bib = QScrollArea()
         self.scroll_bib.setWidgetResizable(True)
@@ -15937,15 +16101,6 @@ class NyuhuhuGallery(QMainWindow):
         self.btn_nota.setToolTip("Califica esta novela del 1 al 10")
         self.btn_nota.clicked.connect(self.elegir_nota_novela)
         fila.addWidget(self.btn_nota)
-        self.buscar_imagen = QLineEdit()
-        self.buscar_imagen.setPlaceholderText("⌕  Buscar imagen o etiqueta...")
-        self.buscar_imagen.setMinimumWidth(220)
-        self._t_busq_img = QTimer(self)
-        self._t_busq_img.setSingleShot(True)
-        self._t_busq_img.setInterval(200)
-        self._t_busq_img.timeout.connect(self.actualizar_galeria)
-        self.buscar_imagen.textChanged.connect(lambda *_: self._t_busq_img.start())
-        fila.addWidget(self.buscar_imagen)
         self.orden = QComboBox()
         self.orden.addItems(["Orden manual", "Más recientes", "Nombre A-Z",
                              "Nombre Z-A", "Favoritos primero"])
@@ -15958,9 +16113,315 @@ class NyuhuhuGallery(QMainWindow):
         self.tabs_juego.addTab(self.construir_musica(), "♪  Música")
         self.tabs_juego.addTab(self.construir_openings_novela(), "🎬  Openings")
         self.tabs_juego.addTab(self.construir_top(), "🏆  Top Heroínas")
+        self.tabs_juego.addTab(self.construir_ficha_novela(), "📖 Ficha y guía")
+        self.tabs_juego.addTab(self.construir_clips(), "🎞 Clips")
+        self.tabs_juego.addTab(self.construir_voces(), "🎙 Voces")
         self.tabs_juego.currentChanged.connect(self._al_cambiar_pestana_juego)
         v.addWidget(self.tabs_juego, 1)
         return w
+
+    def construir_ficha_novela(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(4)
+        ficha = QDialog(w)
+        ficha.setWindowTitle("Editar datos de la novela")
+        ficha.setMinimumWidth(610)
+        self.editor_ficha = ficha
+        datos = QGridLayout(ficha)
+        datos.setContentsMargins(12, 8, 12, 8)
+        datos.setHorizontalSpacing(10)
+        self.ficha_lanzamiento = QLineEdit()
+        self.ficha_lanzamiento.setPlaceholderText("AAAA, AAAA-MM o AAAA-MM-DD")
+        self.ficha_steam = QLineEdit()
+        self.ficha_steam.setPlaceholderText("AAAA-MM-DD")
+        self.ficha_desarrolladora = QLineEdit()
+        self.ficha_desarrolladora.setPlaceholderText("Estudio de desarrollo")
+        self.ficha_vndb = QLineEdit()
+        self.ficha_vndb.setPlaceholderText("https://vndb.org/v1234")
+        for fila, campos in enumerate((
+            (("Lanzamiento original", self.ficha_lanzamiento), ("Lanzamiento en Steam", self.ficha_steam)),
+            (("Desarrolladora", self.ficha_desarrolladora), ("VNDB", self.ficha_vndb)),
+        )):
+            for i, (texto, control) in enumerate(campos):
+                datos.addWidget(QLabel(texto), fila, i * 2)
+                datos.addWidget(control, fila, i * 2 + 1)
+        datos.setColumnStretch(1, 1)
+        datos.setColumnStretch(3, 1)
+        guardar = BotonAnimado("Guardar datos")
+        guardar.clicked.connect(self.guardar_ficha_novela)
+        datos.addWidget(guardar, 0, 4)
+        abrir = BotonAnimado("Abrir VNDB")
+        abrir.clicked.connect(self.abrir_vndb_novela)
+        datos.addWidget(abrir, 1, 4)
+        cancelar = BotonAnimado("Cancelar")
+        cancelar.clicked.connect(ficha.reject)
+        datos.addWidget(cancelar, 2, 4)
+
+        barra = QHBoxLayout()
+        self.guia_estado = QLabel("Sin guía PDF")
+        barra.addWidget(self.guia_estado, 1)
+        self.btn_editar_datos = BotonAnimado("✎ Editar datos")
+        self.btn_editar_datos.clicked.connect(self.editar_datos_novela)
+        barra.addWidget(self.btn_editar_datos)
+        adjuntar = BotonAnimado("Adjuntar o reemplazar PDF")
+        adjuntar.clicked.connect(self.adjuntar_guia)
+        barra.addWidget(adjuntar)
+        self.guia_doble = BotonAnimado("Dos páginas")
+        self.guia_doble.setCheckable(True)
+        barra.addWidget(self.guia_doble)
+        anterior = BotonAnimado("‹")
+        anterior.setToolTip("Página anterior")
+        anterior.clicked.connect(lambda: self._saltar_guia(-1))
+        barra.addWidget(anterior)
+        self.guia_pagina = QSpinBox()
+        self.guia_pagina.setMinimum(1)
+        barra.addWidget(self.guia_pagina)
+        siguiente = BotonAnimado("›")
+        siguiente.setToolTip("Página siguiente")
+        siguiente.clicked.connect(lambda: self._saltar_guia(1))
+        barra.addWidget(siguiente)
+        self.guia_zoom = QComboBox()
+        self.guia_zoom.addItems(["Ajustar al ancho", "Página completa", "100 %", "150 %", "200 %"])
+        barra.addWidget(self.guia_zoom)
+        v.addLayout(barra)
+
+        self.guia_pdf = QPdfDocument(w)
+        self.guia_visor = QPdfView(w)
+        self.guia_visor.setDocument(self.guia_pdf)
+        self.guia_visor_sec = QPdfView(w)
+        self.guia_visor_sec.setDocument(self.guia_pdf)
+        self.guia_visor_sec.setPageMode(QPdfView.PageMode.SinglePage)
+        self.guia_divisor = QFrame()
+        self.guia_divisor.setFrameShape(QFrame.Shape.VLine)
+        self.guia_divisor.setFixedWidth(2)
+        self.guia_fin = QLabel("Última página")
+        self.guia_fin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.guia_fin.setObjectName("muted")
+        self.guia_pareja = QStackedWidget()
+        self.guia_pareja.addWidget(self.guia_visor_sec)
+        self.guia_pareja.addWidget(self.guia_fin)
+        self._zoom_guia_individual = 3
+        self._zoom_guia_doble = 0
+        self.guia_visor.setPageMode(QPdfView.PageMode.MultiPage)
+        self.guia_visor.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        navegador = self.guia_visor.pageNavigator()
+        navegador.currentPageChanged.connect(self._al_pagina_guia)
+        self.guia_pagina.valueChanged.connect(self._ir_pagina_guia)
+        self.guia_zoom.currentIndexChanged.connect(self._zoom_guia)
+        self.guia_zoom.setCurrentIndex(3)
+        lectura = QHBoxLayout()
+        lectura.setSpacing(12)
+        lectura.addWidget(self.guia_visor, 1)
+        lectura.addWidget(self.guia_divisor)
+        lectura.addWidget(self.guia_pareja, 1)
+        self.guia_divisor.hide()
+        self.guia_pareja.hide()
+        self.guia_doble.toggled.connect(self._modo_guia)
+        v.addLayout(lectura, 1)
+        return w
+
+    def editar_datos_novela(self):
+        if self.juego_id is None:
+            return
+        fila = self.conn.execute("""
+            SELECT lanzamiento, lanzamiento_steam, desarrolladora, vndb
+            FROM ficha_novela WHERE juego_id = ?
+        """, (self.juego_id,)).fetchone()
+        controles = (self.ficha_lanzamiento, self.ficha_steam,
+                     self.ficha_desarrolladora, self.ficha_vndb)
+        for campo, valor in zip(controles, fila or ("", "", "", "")):
+            campo.setText(valor or "")
+        self.editor_ficha.exec()
+
+    def _saltar_guia(self, direccion):
+        pasos = 2 if self.guia_doble.isChecked() else 1
+        self.guia_pagina.setValue(self.guia_pagina.value() + direccion * pasos)
+
+    def _modo_guia(self, doble):
+        pagina = self.guia_pagina.value()
+        if doble:
+            self._zoom_guia_individual = self.guia_zoom.currentIndex()
+            zoom = self._zoom_guia_doble
+        else:
+            self._zoom_guia_doble = self.guia_zoom.currentIndex()
+            zoom = self._zoom_guia_individual
+        modo = QPdfView.PageMode.SinglePage if doble else QPdfView.PageMode.MultiPage
+        bloqueado = self.guia_pagina.blockSignals(True)
+        self.guia_visor.setPageMode(modo)
+        self.guia_pagina.setValue(pagina)
+        self.guia_pagina.blockSignals(bloqueado)
+        self.guia_zoom.setCurrentIndex(zoom)
+        self.guia_divisor.setVisible(doble)
+        self.guia_pareja.setVisible(doble)
+        self._ir_pagina_guia(pagina)
+
+    def _pagina_derecha_guia(self, pagina):
+        if self.guia_doble.isChecked():
+            hay_siguiente = pagina + 1 < self.guia_pdf.pageCount()
+            self.guia_pareja.setCurrentIndex(0 if hay_siguiente else 1)
+            if hay_siguiente:
+                self.guia_visor_sec.pageNavigator().jump(pagina + 1, QPointF())
+
+    def _al_pagina_guia(self, pagina):
+        previo = self.guia_pagina.blockSignals(True)
+        self.guia_pagina.setValue(pagina + 1)
+        self.guia_pagina.blockSignals(previo)
+        self._pagina_derecha_guia(pagina)
+
+    def _ir_pagina_guia(self, numero):
+        if self.guia_pdf.status() == QPdfDocument.Status.Ready:
+            self.guia_visor.pageNavigator().jump(numero - 1, QPointF())
+            self._pagina_derecha_guia(numero - 1)
+
+    def _zoom_guia(self, modo):
+        for visor in (self.guia_visor, self.guia_visor_sec):
+            if modo < 2:
+                visor.setZoomMode(
+                    QPdfView.ZoomMode.FitToWidth if modo == 0 else QPdfView.ZoomMode.FitInView)
+            else:
+                visor.setZoomMode(QPdfView.ZoomMode.Custom)
+                visor.setZoomFactor((1.0, 1.5, 2.0)[modo - 2])
+
+    @staticmethod
+    def _vndb_novela(texto):
+        enlace = re.fullmatch(
+            r"(?:https?://(?:www\.)?vndb\.org/)?(v[0-9]+)/?", texto, re.IGNORECASE)
+        return "https://vndb.org/" + enlace[1].lower() if enlace else ""
+
+    def abrir_vndb_novela(self):
+        enlace = self._vndb_novela(self.ficha_vndb.text().strip())
+        if enlace:
+            QDesktopServices.openUrl(QUrl(enlace))
+        else:
+            self.toast("Escribe un enlace de novela de VNDB, por ejemplo v1234.")
+
+    def guardar_ficha_novela(self):
+        if self.juego_id is None:
+            return
+        fecha = self.ficha_lanzamiento.text().strip()
+        steam = self.ficha_steam.text().strip()
+        estudio = self.ficha_desarrolladora.text().strip()
+        for valor in (fecha, steam):
+            if valor:
+                try:
+                    if not re.fullmatch(r"[0-9]{4}(?:-[0-9]{2}(?:-[0-9]{2})?)?", valor):
+                        raise ValueError
+                    datetime.date.fromisoformat(valor + {4: "-01-01", 7: "-01", 10: ""}[len(valor)])
+                except ValueError:
+                    QMessageBox.information(self.editor_ficha, "Fecha inválida", "Usa AAAA, AAAA-MM o AAAA-MM-DD.")
+                    return
+        texto = self.ficha_vndb.text().strip()
+        enlace = self._vndb_novela(texto)
+        if texto and not enlace:
+            QMessageBox.information(self.editor_ficha, "Enlace inválido", "Usa un enlace como https://vndb.org/v1234.")
+            return
+        self.conn.execute("""
+            INSERT INTO ficha_novela(juego_id, lanzamiento, vndb, lanzamiento_steam, desarrolladora)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(juego_id) DO UPDATE SET lanzamiento=excluded.lanzamiento,
+                vndb=excluded.vndb, lanzamiento_steam=excluded.lanzamiento_steam,
+                desarrolladora=excluded.desarrolladora
+        """, (self.juego_id, fecha, enlace, steam, estudio))
+        self.conn.commit()
+        self.ficha_vndb.setText(enlace)
+        self.editor_ficha.accept()
+        self.toast("Datos de la novela guardados.")
+
+    def _ruta_guia_adjunta(self):
+        fila = self.conn.execute(
+            "SELECT guia FROM ficha_novela WHERE juego_id=?", (self.juego_id,)
+        ).fetchone()
+        nombre = fila[0] if fila else ""
+        return ASSETS / "guias" / nombre if re.fullmatch(
+            rf"novela_{self.juego_id}_[a-z0-9_]+\.pdf", nombre) else None
+
+    def _ruta_guia(self):
+        adjunta = self._ruta_guia_adjunta()
+        if adjunta is not None and adjunta.is_file():
+            return adjunta
+        carpeta = (ROOT / self.juego_carpeta).resolve()
+        if carpeta.is_relative_to(ROOT.resolve()):
+            return carpeta / "Guía de rutas - Nyuhuhu.pdf"
+        return None
+
+    def cargar_ficha_novela(self):
+        if self.juego_id is None:
+            return
+        ficha = self.conn.execute(
+            "SELECT lanzamiento, vndb, lanzamiento_steam, desarrolladora "
+            "FROM ficha_novela WHERE juego_id=?", (self.juego_id,)
+        ).fetchone() or ("", "", "", "")
+        self.ficha_lanzamiento.setText(ficha[0])
+        self.ficha_vndb.setText(ficha[1])
+        self.ficha_steam.setText(ficha[2])
+        self.ficha_desarrolladora.setText(ficha[3])
+        self._cargar_guia()
+
+    def _cargar_guia(self):
+        self.guia_pdf.close()
+        ruta = self._ruta_guia()
+        paginas = 0
+        if ruta is not None and ruta.is_file():
+            if self.guia_pdf.load(str(ruta)) == QPdfDocument.Error.None_:
+                paginas = self.guia_pdf.pageCount()
+            self.guia_estado.setText(
+                f"Guía PDF · {paginas} páginas" if paginas else "No se pudo leer la guía PDF")
+        else:
+            self.guia_estado.setText("Sin guía PDF")
+        previo = self.guia_pagina.blockSignals(True)
+        self.guia_pagina.setRange(1, max(1, paginas))
+        self.guia_pagina.setValue(1)
+        self.guia_pagina.blockSignals(previo)
+        self.guia_pagina.setEnabled(bool(paginas))
+        self.guia_zoom.setEnabled(bool(paginas))
+        self.guia_doble.setEnabled(bool(paginas))
+        self.guia_visor.setVisible(bool(paginas))
+        self.guia_divisor.setVisible(bool(paginas) and self.guia_doble.isChecked())
+        self.guia_pareja.setVisible(bool(paginas) and self.guia_doble.isChecked())
+        if paginas:
+            self._ir_pagina_guia(1)
+
+    def adjuntar_guia(self):
+        if self.juego_id is None:
+            return
+        origen, _ = QFileDialog.getOpenFileName(self, "Guía de la novela", str(Path.home()), "PDF (*.pdf)")
+        if not origen:
+            return
+        anterior = self._ruta_guia_adjunta()
+        carpeta = ASSETS / "guias"
+        temporal = None
+        guardado = False
+        verificador = QPdfDocument(self)
+        try:
+            error = verificador.load(origen)
+            valido = error == QPdfDocument.Error.None_ and verificador.pageCount() > 0
+            verificador.close()
+            if not valido:
+                self.toast("El archivo no es un PDF legible o está protegido con contraseña.")
+                return
+            carpeta.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                    dir=carpeta, prefix=f"novela_{self.juego_id}_", suffix=".pdf", delete=False
+            ) as salida:
+                temporal = Path(salida.name)
+            shutil.copyfile(origen, temporal)
+            with self.conn:
+                self.conn.execute("""
+                    INSERT INTO ficha_novela(juego_id, guia) VALUES (?, ?)
+                    ON CONFLICT(juego_id) DO UPDATE SET guia=excluded.guia
+                """, (self.juego_id, temporal.name))
+            guardado = True
+            self._cargar_guia()
+            if anterior is not None:
+                QTimer.singleShot(500, lambda: self._borrar_archivo_temporal(anterior))
+        except (OSError, sqlite3.Error):
+            self.toast("No se pudo guardar el PDF.")
+        finally:
+            verificador.deleteLater()
+            if temporal is not None and not guardado:
+                self._borrar_archivo_temporal(temporal)
 
     def construir_galeria(self):
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -16544,15 +17005,13 @@ class NyuhuhuGallery(QMainWindow):
 
     def actualizar_contador_favoritos(self):
         n = self.contar_favoritos()
-        self.b_favs.setText(f"★ Capturas Favoritas ({n})")
-        self.b_favs.updateGeometry()
         if hasattr(self, "lbl_fav"):
             self.lbl_fav.setText(
                 f"{n} {'captura favorita' if n == 1 else 'capturas favoritas'} de todas tus novelas"
                 if n else "Aún no tienes favoritas.")
 
     def cargar_favoritos(self, *args):
-        """Recarga «Capturas Favoritas» (las 4 partes) y el contador del botón."""
+        """Recarga las secciones de capturas favoritas."""
         self.cargar_top_caps()
         self.actualizar_contador_favoritos()
 
@@ -16932,7 +17391,13 @@ class NyuhuhuGallery(QMainWindow):
     def crear_motor_audio(self):
         self._ruta_musica = None
         self._normalizando = None
-        self._cache_musica = QTemporaryDir()
+        self._cache_musica = ASSETS / "audio_equilibrado"
+        self._cola_mp3 = {}
+        self._pedido_mp3 = None
+        self._trabajo_mp3 = None
+        self._timer_mp3 = QTimer(self)
+        self._timer_mp3.setSingleShot(True)
+        self._timer_mp3.timeout.connect(self._siguiente_mp3)
         self._ffmpeg = recurso("ffmpeg.exe")
         if not self._ffmpeg.is_file():
             try:
@@ -16981,8 +17446,11 @@ class NyuhuhuGallery(QMainWindow):
         self.btn_play.set_icono("pause" if sonando else "play")
         self.eq.activar(sonando)
         self.disco.activar(sonando)
+        if sonando and self.voces_player is not None:
+            self.voces_player.pause()
         if sonando and OPENING_PAUSA_MUSICA:
-            for rp in (getattr(self, "opening", None), getattr(self, "opening_global", None)):
+            for rp in (getattr(self, "opening", None), getattr(self, "opening_global", None),
+                       self.clips_reproductor):
                 if rp is not None:
                     rp.pausar()
         if hasattr(self, "lista_musica"):
@@ -17032,73 +17500,139 @@ class NyuhuhuGallery(QMainWindow):
             self.lista_musica.viewport().update()
         self._preparar_mp3(Path(ruta), titulo)
 
-    def _preparar_mp3(self, ruta, titulo):
-        if ruta.suffix.lower() != ".mp3" or not self._ffmpeg or not self._cache_musica.isValid():
-            self._abrir_musica(ruta)
-            return
-
+    def _archivo_equilibrado(self, ruta):
+        if ruta.suffix.lower() != ".mp3" or not self._ffmpeg:
+            return None
         try:
-            datos = ruta.stat()
+            estado = ruta.stat()
         except OSError:
-            self._abrir_musica(ruta)
-            return
-        clave = hashlib.sha256(
-            os.fsencode(str(ruta.absolute())) + f":{datos.st_size}:{datos.st_mtime_ns}".encode()
-        ).hexdigest()
-        salida = Path(self._cache_musica.path()) / f"{clave}.flac"
-        if salida.is_file():
-            self._abrir_musica(salida)
-            return
+            return None
+        ruta_id = hashlib.sha256(os.fsencode(os.path.normcase(str(ruta.absolute())))).hexdigest()
+        return self._cache_musica / f"{ruta_id}-{estado.st_size}-{estado.st_mtime_ns}.m4a"
 
+    def _encolar_biblioteca_mp3(self):
+        for (ruta,) in self.conn.execute(
+                "SELECT DISTINCT ruta FROM musica WHERE lower(ruta) LIKE '%.mp3'"):
+            self._cola_mp3[Path(ruta)] = None
+        self._timer_mp3.start(100)
+
+    def _siguiente_mp3(self):
+        if self._normalizando is not None or not self._cola_mp3:
+            return
+        ruta = next(iter(self._cola_mp3))
+        del self._cola_mp3[ruta]
+        salida = self._archivo_equilibrado(ruta)
+        if salida is None or salida.is_file():
+            self._timer_mp3.start(0)
+        else:
+            self._normalizar_mp3(ruta, salida)
+
+    def _preparar_mp3(self, ruta, titulo):
+        salida = self._archivo_equilibrado(ruta)
+        if salida is None or salida.is_file():
+            self._abrir_musica(salida or ruta)
+            return
+        self._pedido_mp3 = (ruta, titulo)
+        self.lbl_pista.setText(f"Preparando por primera vez: {titulo}")
+        if self._trabajo_mp3 and self._trabajo_mp3[0] == ruta:
+            return
+        if self._trabajo_mp3:
+            self._cola_mp3[self._trabajo_mp3[0]] = None
+            self._cancelar_normalizacion()
+        self._cola_mp3.pop(ruta, None)
+        self._normalizar_mp3(ruta, salida)
+
+    def _normalizar_mp3(self, ruta, salida):
+        try:
+            self._cache_musica.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=self._cache_musica, suffix=".part",
+                                             delete=False) as archivo:
+                temporal = Path(archivo.name)
+        except OSError:
+            self._terminar_pedido_mp3(ruta, ruta)
+            self._timer_mp3.start(0)
+            return
         proceso = QProcess(self)
         self._normalizando = proceso
-        self.lbl_pista.setText(f"Equilibrando volumen: {titulo}")
+        self._trabajo_mp3 = (ruta, temporal)
         proceso.setStandardOutputFile(QProcess.nullDevice())
         proceso.setStandardErrorFile(QProcess.nullDevice())
+
+        def terminar(exito):
+            if self._normalizando is not proceso:
+                return
+            self._normalizando = None
+            self._trabajo_mp3 = None
+            proceso.deleteLater()
+            resultado = ruta
+            try:
+                if exito and temporal.stat().st_size > 0 and self._archivo_equilibrado(ruta) == salida:
+                    temporal.replace(salida)
+                    resultado = salida
+                    for anterior in salida.parent.glob(salida.name.split("-", 1)[0] + "-*.m4a"):
+                        if anterior != salida:
+                            anterior.unlink(missing_ok=True)
+            except OSError:
+                pass
+            finally:
+                self._borrar_archivo_temporal(temporal)
+            self._terminar_pedido_mp3(ruta, resultado)
+            self._timer_mp3.start(50)
+
         proceso.finished.connect(
             lambda codigo, estado: terminar(codigo == 0 and estado == QProcess.ExitStatus.NormalExit)
         )
         proceso.errorOccurred.connect(
             lambda error: terminar(False) if error == QProcess.ProcessError.FailedToStart else None
         )
-
-        def terminar(exito):
-            if self._normalizando is not proceso:
-                return
-            self._normalizando = None
-            proceso.deleteLater()
-            self.lbl_pista.setText(titulo)
-            if exito and salida.is_file():
-                self._abrir_musica(salida)
-            else:
-                salida.unlink(missing_ok=True)
-                self._abrir_musica(ruta)
-
-        self._salida_normalizada = salida
         proceso.start(str(self._ffmpeg), [
             "-nostdin", "-v", "error", "-y", "-i", str(ruta.absolute()),
-            "-map", "0:a:0", "-map_metadata", "-1",
-            "-af", "loudnorm=I=-16:TP=-2:LRA=11", "-ar", "48000", str(salida),
+            "-map", "0:a:0", "-map_metadata", "-1", "-filter_threads", "1",
+            "-af", "loudnorm=I=-16:TP=-2:LRA=11", "-ar", "48000",
+            "-c:a", "aac", "-b:a", "192k", "-threads", "1", "-f", "ipod", str(temporal),
         ])
+
+    def _terminar_pedido_mp3(self, ruta, resultado):
+        if self._pedido_mp3 and self._pedido_mp3[0] == ruta:
+            _ruta, titulo = self._pedido_mp3
+            self._pedido_mp3 = None
+            self.lbl_pista.setText(titulo)
+            self._abrir_musica(resultado)
+
+    @staticmethod
+    def _borrar_archivo_temporal(temporal):
+        try:
+            temporal.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _cancelar_normalizacion(self):
+        proceso = self._normalizando
+        if proceso is not None:
+            _ruta, temporal = self._trabajo_mp3
+            self._normalizando = self._trabajo_mp3 = None
+            proceso.kill()
+            proceso.waitForFinished(200)
+            proceso.deleteLater()
+            self._borrar_archivo_temporal(temporal)
 
     def _abrir_musica(self, ruta):
         self.player.setSource(QUrl.fromLocalFile(str(ruta)))
         self.player.play()
 
     def _detener_musica(self):
-        proceso = self._normalizando
-        if proceso is not None:
-            self._normalizando = None
-            proceso.kill()
-            proceso.waitForFinished()
-            proceso.deleteLater()
-            self._salida_normalizada.unlink(missing_ok=True)
+        self._pedido_mp3 = None
         self.player.stop()
         self.player.setSource(QUrl())
         self._ruta_musica = None
 
+    def _cerrar_audio(self):
+        self._timer_mp3.stop()
+        self._detener_musica()
+        self._cancelar_normalizacion()
+
     def alternar_play(self):
-        if self._normalizando is not None:
+        if self._pedido_mp3 is not None:
             self._detener_musica()
             if 0 <= self.cola_idx < len(self.cola):
                 self.lbl_pista.setText(self.cola[self.cola_idx][0])
@@ -17170,6 +17704,7 @@ class NyuhuhuGallery(QMainWindow):
                 (self.juego_id, Path(a).stem, str(destino)))
         self.conn.commit()
         self.cargar_musica()
+        self._encolar_biblioteca_mp3()
         self.toast(f"♪ {len(archivos)} pista(s) añadidas")
 
     def renombrar_musica(self):
@@ -17193,6 +17728,9 @@ class NyuhuhuGallery(QMainWindow):
                 raise FileExistsError
             if self._ruta_musica and Path(self._ruta_musica) == ruta_p:
                 self._detener_musica()
+            if self._trabajo_mp3 and self._trabajo_mp3[0] == ruta_p:
+                self._cancelar_normalizacion()
+                self._timer_mp3.start(50)
             ruta_p.rename(destino)
             nueva_ruta = str(destino)
         except Exception:
@@ -17231,6 +17769,9 @@ class NyuhuhuGallery(QMainWindow):
         borradas, fallos = [], 0
         for mid, ruta in filas:
             try:
+                if self._trabajo_mp3 and self._trabajo_mp3[0] == Path(ruta):
+                    self._cancelar_normalizacion()
+                    self._timer_mp3.start(50)
                 Path(ruta).unlink(missing_ok=True)
                 self.conn.execute("DELETE FROM musica WHERE id = ?", (mid,))
                 borradas.append(ruta)
@@ -17251,50 +17792,55 @@ class NyuhuhuGallery(QMainWindow):
     def cargar_openings(self, autoplay=False, forzar=False):
         if self.juego_id is None:
             return
-        filas = self.conn.execute(
-            "SELECT id, titulo, ruta FROM videos WHERE juego_id = ? ORDER BY orden, id",
-            (self.juego_id,)).fetchall()
+        filas = self.conn.execute("""
+            SELECT v.id, v.titulo, v.ruta, v.me_gusta, j.nombre, j.portada, j.portada_enc
+            FROM videos v JOIN juegos j ON j.id = v.juego_id
+            WHERE j.id = ? ORDER BY v.orden, v.id
+        """, (self.juego_id,)).fetchall()
         lista = self.lista_openings
+        elegido = lista.currentItem()
+        elegido = elegido.data(Qt.ItemDataRole.UserRole) if elegido else None
         lista.setUpdatesEnabled(False)
         lista.clear()
-        total = 0
-        for n, (vid, titulo, ruta) in enumerate(filas, 1):
-            try:
-                peso = Path(ruta).stat().st_size
-            except OSError:
-                peso = -1
-            total += max(0, peso)
-            extra = fmt_peso(peso) if peso >= 0 else "⚠ no se encuentra el archivo"
-            it = QListWidgetItem(f"{n}.   🎬  {titulo}        {extra}")
-            it.setData(Qt.ItemDataRole.UserRole, vid)
-            it.setData(Qt.ItemDataRole.UserRole + 1, ruta)
-            it.setToolTip(ruta)
-            it.setSizeHint(QSize(0, 34))
-            lista.addItem(it)
+        for vid, titulo, ruta, favorito, novela, portada, enc in filas:
+            item = QListWidgetItem(titulo)
+            item.setData(Qt.ItemDataRole.UserRole, vid)
+            item.setData(Qt.ItemDataRole.UserRole + 1,
+                         dict(titulo=titulo, ruta=ruta, favorito=bool(favorito),
+                              novela=novela, portada=portada, enc=parse_enc(enc)))
+            item.setToolTip(titulo)
+            lista.addItem(item)
+            if elegido == vid:
+                lista.setCurrentItem(item)
         lista.setUpdatesEnabled(True)
-        self.lbl_op_resumen.setText(f"{len(filas)} opening(s)" if filas else "Sin openings")
-        self.lbl_op_total.setText(fmt_peso(total) if filas else
-                                  "Añade el video de tu opening (puedes subir varios)")
-        self.opening.cargar([r for _v, _t, r in filas], autoplay, forzar,
-                            [t for _v, t, _r in filas])
+        if lista.currentRow() < 0 and lista.count():
+            lista.setCurrentRow(0)
+        self.lbl_op_resumen.setText(
+            "Openings de la novela" if filas else "Adjunta un video para empezar")
+        self.opening.cargar([fila[2] for fila in filas], autoplay, forzar,
+                            [fila[1] for fila in filas])
+
     def _guardar_volumen_opening(self, v):
         self._pendientes["opening_volumen"] = v
         self._timer_guardar.start(500)
 
     def _opening_empezo(self, rp=None):
+        if self.voces_player is not None:
+            self.voces_player.pause()
         if OPENING_PAUSA_MUSICA:
-            if self._normalizando is not None:
+            if self._pedido_mp3 is not None:
                 self.alternar_play()
             elif self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 self.player.pause()
-        for otro in (getattr(self, "opening", None), getattr(self, "opening_global", None)):
+        for otro in (getattr(self, "opening", None), getattr(self, "opening_global", None),
+                     self.clips_reproductor):
             if otro is not None and otro is not rp:
                 otro.pausar()
 
-    def _copiar_con_progreso(self, origen, destino):
+    def _copiar_con_progreso(self, origen, destino, titulo="Añadiendo opening"):
         total = max(1, Path(origen).stat().st_size)
         dlg = QProgressDialog(f"Copiando «{Path(origen).name}»…", "Cancelar", 0, 100, self)
-        dlg.setWindowTitle("Añadiendo opening")
+        dlg.setWindowTitle(titulo)
         dlg.setWindowModality(Qt.WindowModality.WindowModal)
         dlg.setMinimumDuration(400)
         dlg.setValue(0)
@@ -17346,7 +17892,12 @@ class NyuhuhuGallery(QMainWindow):
 
     def reproducir_opening(self, item):
         self.tabs_juego.setCurrentIndex(self.IDX_OPENINGS)
-        self.opening.reproducir_ruta(item.data(Qt.ItemDataRole.UserRole + 1))
+        ruta = item.data(Qt.ItemDataRole.UserRole + 1)["ruta"]
+        if ruta in self.opening._rutas:
+            self.opening.reproducir_ruta(ruta)
+        else:
+            self.toast("El archivo de video ya no está en el disco.")
+
     def menu_openings(self, punto):
         it = self.lista_openings.itemAt(punto)
         if it is None:
@@ -17357,9 +17908,6 @@ class NyuhuhuGallery(QMainWindow):
         a_ren = m.addAction("✎ Renombrar")
         a_ubi = m.addAction("📂 Abrir ubicación del archivo")
         m.addSeparator()
-        a_sub = m.addAction("▲ Subir")
-        a_baj = m.addAction("▼ Bajar")
-        m.addSeparator()
         a_del = m.addAction("🗑 Eliminar permanentemente")
         eleg = m.exec(self.lista_openings.viewport().mapToGlobal(punto))
         if eleg == a_ver:
@@ -17368,27 +17916,8 @@ class NyuhuhuGallery(QMainWindow):
             self.renombrar_opening(vid)
         elif eleg == a_ubi:
             self.ubicacion_opening(vid)
-        elif eleg == a_sub:
-            self.mover_opening(vid, -1)
-        elif eleg == a_baj:
-            self.mover_opening(vid, 1)
         elif eleg == a_del:
             self.eliminar_opening(vid)
-    def mover_opening(self, vid, d):
-        ids = [r[0] for r in self.conn.execute(
-            "SELECT id FROM videos WHERE juego_id = ? ORDER BY orden, id", (self.juego_id,))]
-        if vid not in ids:
-            return
-        i = ids.index(vid)
-        j = i + d
-        if not 0 <= j < len(ids):
-            return
-        ids[i], ids[j] = ids[j], ids[i]
-        for pos, x in enumerate(ids, 1):
-            self.conn.execute("UPDATE videos SET orden = ? WHERE id = ?", (pos, x))
-        self.conn.commit()
-        self.cargar_openings()
-
     def eliminar_opening(self, vid):
         fila = self.conn.execute("SELECT titulo, ruta FROM videos WHERE id = ?", (vid,)).fetchone()
         if not fila:
@@ -17411,7 +17940,8 @@ class NyuhuhuGallery(QMainWindow):
 
     def _soltar_openings(self, procesar=True):
         """Suelta los archivos de video de las dos pantallas (conservan su lista)."""
-        for rp in (getattr(self, "opening", None), getattr(self, "opening_global", None)):
+        for rp in (getattr(self, "opening", None), getattr(self, "opening_global", None),
+                       self.clips_reproductor):
             if rp is not None:
                 rp.soltar()
         if procesar:
@@ -17456,13 +17986,6 @@ class NyuhuhuGallery(QMainWindow):
         else:
             self.toast("El archivo ya no existe en el disco")
 
-    def guardar_orden_openings(self):
-        ids = [self.lista_openings.item(i).data(Qt.ItemDataRole.UserRole)
-               for i in range(self.lista_openings.count())]
-        for pos, x in enumerate(ids, 1):
-            self.conn.execute("UPDATE videos SET orden = ? WHERE id = ?", (pos, x))
-        self.conn.commit()
-        self.cargar_openings()
     # -----------------------------------------------------
     # PESTAÑA «OPENINGS» DE LA NOVELA
     # -----------------------------------------------------
@@ -17488,77 +18011,506 @@ class NyuhuhuGallery(QMainWindow):
     def construir_openings_novela(self):
         w = QWidget()
         h = QHBoxLayout(w)
-        h.setSpacing(16)
+        h.setContentsMargins(8, 8, 8, 8)
+        h.setSpacing(10)
+        self.opening = self._nuevo_reproductor_opening()
+        h.addWidget(self.opening, 1)
 
-        izq = QFrame()
-        izq.setObjectName("panel")
-        izq.setFixedWidth(330)
-        il = QVBoxLayout(izq)
-        il.setContentsMargins(12, 12, 12, 12)
-        self.cover_openings = CoverWidget("", 260)
-        il.addWidget(self.cover_openings, 1)
-        self.lbl_op_resumen = QLabel("")
+        catalogo = QFrame()
+        catalogo.setObjectName("panel")
+        catalogo.setMinimumWidth(250)
+        catalogo.setMaximumWidth(345)
+        layout = QVBoxLayout(catalogo)
+        layout.setContentsMargins(10, 12, 10, 12)
+        self.lbl_op_resumen = QLabel("Openings de la novela")
         self.lbl_op_resumen.setObjectName("heading")
         self.lbl_op_resumen.setWordWrap(True)
-        il.addWidget(self.lbl_op_resumen)
-        self.lbl_op_total = QLabel("")
-        self.lbl_op_total.setObjectName("muted")
-        self.lbl_op_total.setWordWrap(True)
-        il.addWidget(self.lbl_op_total)
-        b_ver = BotonAnimado("▶ Ver todos", primario=True)
-        b_ver.clicked.connect(lambda: self.opening.reproducir_indice(0))
-        b_add = BotonAnimado("＋ Añadir opening")
-        b_add.setToolTip("Sube el video del opening (puedes subir varios: suenan uno tras otro)")
-        b_add.clicked.connect(self.anadir_opening)
-        il.addWidget(b_ver)
-        il.addWidget(b_add)
-        self.chk_auto_op = QCheckBox("Empezar solo al abrir esta pestaña")
-        try:
-            f = self.conn.execute(
-                "SELECT valor FROM ajustes WHERE clave = 'opening_auto'").fetchone()
-            self.chk_auto_op.setChecked(bool(f) and f[0] == "1")
-        except sqlite3.Error:
-            pass
-        self.chk_auto_op.toggled.connect(lambda v: guardar_ajuste(self.conn, "opening_auto", v))
-        il.addWidget(self.chk_auto_op)
-        h.addWidget(izq)
+        layout.addWidget(self.lbl_op_resumen)
 
-        col = QVBoxLayout()
-        t = QLabel("🎬 Openings")
-        t.setObjectName("heading")
-        col.addWidget(t)
-        self.opening = self._nuevo_reproductor_opening()
-        self.opening.indice_cambiado.connect(lambda i: self._marcar_fila(self.lista_openings, i))
         self.lista_openings = QListWidget()
+        self.lista_openings.setItemDelegate(DelegadoCatalogoOpening(self.lista_openings))
         self.lista_openings.setUniformItemSizes(True)
         self.lista_openings.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.lista_openings.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.lista_openings.customContextMenuRequested.connect(self.menu_openings)
-        self.lista_openings.itemDoubleClicked.connect(self.reproducir_opening)
-        self.lista_openings.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.lista_openings.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.lista_openings.model().rowsMoved.connect(
-            lambda *a: QTimer.singleShot(0, self.guardar_orden_openings))
-        self.lista_openings.setToolTip(
-            "Doble clic: ver · arrastra para ordenar · clic derecho: renombrar, ubicación, eliminar")
-        sp = QSplitter(Qt.Orientation.Vertical)
-        sp.setChildrenCollapsible(False)
-        sp.addWidget(self.opening)
-        sp.addWidget(self.lista_openings)
-        sp.setStretchFactor(0, 4)
-        sp.setStretchFactor(1, 1)
-        col.addWidget(sp, 1)
-        h.addLayout(col, 1)
+        self.lista_openings.itemActivated.connect(self.reproducir_opening)
+        self.lista_openings.setToolTip("Doble clic o Enter para ver. Esc para salir del video.")
+        self.opening.indice_cambiado.connect(lambda _: self._seleccionar_opening_en_video())
+        self.opening.reposo.clic.disconnect(self.opening.alternar_play)
+        self.opening.reposo.clic.connect(
+            lambda: self._accion_opening_novela(self.reproducir_opening))
+        layout.addWidget(self.lista_openings, 1)
+        acciones = QHBoxLayout()
+        ver = BotonAnimado("▶ Ver", primario=True)
+        ver.clicked.connect(lambda: self._accion_opening_novela(self.reproducir_opening))
+        corazon = BotonAnimado("♡ Favorito")
+        corazon.clicked.connect(lambda: self._accion_opening_novela(self._favorito_opening_novela))
+        acciones.addWidget(ver)
+        acciones.addWidget(corazon)
+        layout.addLayout(acciones)
+        adjuntar = BotonAnimado("＋ Adjuntar video")
+        adjuntar.clicked.connect(self.anadir_opening)
+        layout.addWidget(adjuntar)
+        layout.addWidget(self._boton_cerrar_video(self.opening))
+        h.addWidget(catalogo)
         return w
 
+    def _boton_cerrar_video(self, reproductor):
+        cerrar = BotonAnimado("Cerrar video")
+        cerrar.setToolTip("Cerrar el video y regresar al catálogo (Esc)")
+        cerrar.clicked.connect(self._salir_del_opening)
+        cerrar.hide()
+        reproductor.player.sourceChanged.connect(
+            lambda url: cerrar.setVisible(not url.isEmpty()))
+        return cerrar
+
+    def _accion_opening_novela(self, accion):
+        item = self.lista_openings.currentItem()
+        if item is not None:
+            accion(item)
+
+    def _favorito_opening_novela(self, item):
+        self._marcar_opening_favorito(item.data(Qt.ItemDataRole.UserRole))
+        self.cargar_openings()
+
+    def _seleccionar_opening_en_video(self):
+        ruta = self._ruta_opening_actual(self.opening)
+        for fila in range(self.lista_openings.count()):
+            item = self.lista_openings.item(fila)
+            if item.data(Qt.ItemDataRole.UserRole + 1)["ruta"] == ruta:
+                self._marcar_fila(self.lista_openings, fila)
+                return
+
+    def construir_clips(self):
+        vista = QWidget()
+        cuerpo = QHBoxLayout(vista)
+        cuerpo.setContentsMargins(8, 8, 8, 8)
+        self.escenario_clips = QVBoxLayout()
+        cuerpo.addLayout(self.escenario_clips, 1)
+
+        panel = QFrame()
+        panel.setObjectName("panel")
+        panel.setMinimumWidth(235)
+        panel.setMaximumWidth(360)
+        lado = QVBoxLayout(panel)
+        titulo = QLabel("Clips de la novela")
+        titulo.setObjectName("heading")
+        lado.addWidget(titulo)
+        self.lista_clips = QListWidget()
+        self.lista_clips.setUniformItemSizes(True)
+        self.lista_clips.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.lista_clips.itemActivated.connect(self.reproducir_clip)
+        lado.addWidget(self.lista_clips, 1)
+
+        acciones = QHBoxLayout()
+        ver = BotonAnimado("▶ Reproducir", primario=True)
+        ver.clicked.connect(lambda: self.reproducir_clip(self.lista_clips.currentItem()))
+        acciones.addWidget(ver)
+        agregar = BotonAnimado("＋ Adjuntar")
+        agregar.clicked.connect(self.adjuntar_clips)
+        acciones.addWidget(agregar)
+        lado.addLayout(acciones)
+        renombrar = BotonAnimado("✎ Renombrar archivo")
+        renombrar.clicked.connect(lambda: self._renombrar_adjunto("clips"))
+        lado.addWidget(renombrar)
+        cuerpo.addWidget(panel)
+        return vista
+
+    def cargar_clips(self, seleccion=None):
+        if self.juego_id is None:
+            return
+        if self.clips_reproductor is None:
+            self.clips_reproductor = self._nuevo_reproductor_opening()
+            reproductor = self.clips_reproductor
+            reproductor.reposo.clic.disconnect(reproductor.alternar_play)
+            reproductor.reposo.clic.connect(
+                lambda: self.reproducir_clip(self.lista_clips.currentItem()))
+            self.escenario_clips.addWidget(reproductor, 1)
+            self.escenario_clips.addWidget(self._boton_cerrar_video(reproductor))
+        registros = self.conn.execute(
+            "SELECT id, titulo, ruta FROM clips WHERE juego_id=? ORDER BY id", (self.juego_id,)
+        ).fetchall()
+        self.lista_clips.clear()
+        for id_clip, titulo, ruta in registros:
+            item = QListWidgetItem(titulo)
+            item.setData(Qt.ItemDataRole.UserRole, ruta)
+            item.setData(Qt.ItemDataRole.UserRole + 1, id_clip)
+            item.setToolTip(Path(ruta).name)
+            item.setSizeHint(QSize(0, 38))
+            self.lista_clips.addItem(item)
+        if registros:
+            fila = next((i for i, r in enumerate(registros) if r[0] == seleccion), 0)
+            self.lista_clips.setCurrentRow(fila)
+        self.clips_reproductor.cargar([r[2] for r in registros], titulos=[r[1] for r in registros])
+        if not registros:
+            self.clips_reproductor.reposo.setText("Adjunta un clip para empezar")
+
+    def reproducir_clip(self, item):
+        if item is None or self.clips_reproductor is None:
+            return
+        ruta = item.data(Qt.ItemDataRole.UserRole)
+        if ruta in self.clips_reproductor._rutas:
+            self.clips_reproductor.reproducir_ruta(ruta)
+        else:
+            self.toast("El archivo del clip ya no está en el disco.")
+
+    def adjuntar_clips(self):
+        if self.juego_id is None:
+            return
+        archivos, _ = QFileDialog.getOpenFileNames(
+            self, "Adjuntar clips a la novela", str(ROOT), f"Videos ({EXT_VIDEO})")
+        if not archivos:
+            return
+        carpeta = (ROOT / self.juego_carpeta / "Clips").resolve()
+        if not carpeta.is_relative_to(ROOT.resolve()):
+            self.toast("La carpeta de clips debe estar dentro de la biblioteca.")
+            return
+        try:
+            carpeta.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self.toast("No se pudo crear la carpeta de clips.")
+            return
+        jid = self.juego_id
+        cantidad = 0
+        for archivo in archivos:
+            origen = Path(archivo)
+            destino = nombre_disponible(carpeta, origen.name)
+            if not self._copiar_con_progreso(archivo, destino, "Adjuntando clip"):
+                break
+            with self.conn:
+                self.conn.execute("INSERT INTO clips(juego_id,titulo,ruta) VALUES (?,?,?)",
+                                  (jid, origen.stem, str(destino)))
+            cantidad += 1
+        if cantidad:
+            self.cargar_clips()
+            self.toast(f"{cantidad} {'clip adjuntado' if cantidad == 1 else 'clips adjuntados'}.")
+
+    def _detener_clips(self):
+        if self.clips_reproductor is not None:
+            self.clips_reproductor.detener()
+
+    def construir_voces(self):
+        vista = QWidget()
+        cuerpo = QVBoxLayout(vista)
+        cuerpo.setContentsMargins(8, 8, 8, 8)
+        panel = QFrame()
+        panel.setObjectName("panel")
+        contenido = QVBoxLayout(panel)
+        cabecera = QHBoxLayout()
+        titulo = QLabel("Voces de la novela")
+        titulo.setObjectName("heading")
+        cabecera.addWidget(titulo)
+        cabecera.addStretch(1)
+        adjuntar = BotonAnimado("＋ Adjuntar audio", primario=True)
+        adjuntar.clicked.connect(self.adjuntar_voz)
+        cabecera.addWidget(adjuntar)
+        renombrar = BotonAnimado("✎ Renombrar archivo")
+        renombrar.clicked.connect(lambda: self._renombrar_adjunto("voces"))
+        cabecera.addWidget(renombrar)
+        contenido.addLayout(cabecera)
+
+        self.lista_voces = QListWidget()
+        self._configurar_tarjetas_voces(self.lista_voces)
+        self.lista_voces.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.lista_voces.itemActivated.connect(self.reproducir_voz)
+        contenido.addWidget(self.lista_voces, 1)
+        self.estado_voces = QLabel()
+        contenido.addWidget(self.estado_voces)
+
+        controles = QHBoxLayout()
+        self.btn_voz = BotonAnimado("▶ Reproducir")
+        self.btn_voz.clicked.connect(self._alternar_voz)
+        controles.addWidget(self.btn_voz)
+        detener = BotonAnimado("■ Detener")
+        detener.clicked.connect(self._detener_voces)
+        controles.addWidget(detener)
+        self.posicion_voces = QSlider(Qt.Orientation.Horizontal)
+        self.posicion_voces.setAccessibleName("Posición de la voz")
+        self.posicion_voces.setRange(0, 0)
+        self.posicion_voces.sliderMoved.connect(
+            lambda posicion: self.voces_player.setPosition(posicion) if self.voces_player else None)
+        controles.addWidget(self.posicion_voces, 1)
+        self.tiempo_voces = QLabel("0:00 / 0:00")
+        controles.addWidget(self.tiempo_voces)
+        controles.addWidget(QLabel("Volumen"))
+        self.volumen_voces = QSlider(Qt.Orientation.Horizontal)
+        self.volumen_voces.setAccessibleName("Volumen de voces")
+        self.volumen_voces.setRange(0, 100)
+        self.volumen_voces.setValue(85)
+        self.volumen_voces.setFixedWidth(105)
+        self.volumen_voces.valueChanged.connect(
+            lambda valor: self.voces_audio.setVolume(valor / 100) if self.voces_player else None)
+        controles.addWidget(self.volumen_voces)
+        contenido.addLayout(controles)
+        cuerpo.addWidget(panel, 1)
+        return vista
+
+    @staticmethod
+    def _configurar_tarjetas_voces(lista):
+        lista.setViewMode(QListWidget.ViewMode.IconMode)
+        lista.setMovement(QListWidget.Movement.Static)
+        lista.setResizeMode(QListWidget.ResizeMode.Adjust)
+        lista.setIconSize(QSize(164, 164))
+        lista.setGridSize(QSize(220, 230))
+        lista.setSpacing(8)
+        lista.setWordWrap(True)
+        lista.setUniformItemSizes(True)
+        lista.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+
+    @staticmethod
+    def _icono_voz(foto, encuadre):
+        return QIcon(avatar(foto or "", 164, parse_enc(encuadre)))
+
+    def _elegir_heroina_voz(self, heroinas, archivo):
+        dialogo = QDialog(self)
+        dialogo.setWindowTitle("Asignar audio a una heroína")
+        dialogo.resize(930, 640)
+        contenido = QVBoxLayout(dialogo)
+        texto = QLabel(f"¿De quién es «{archivo}»?")
+        texto.setWordWrap(True)
+        contenido.addWidget(texto)
+        buscar = QLineEdit()
+        buscar.setPlaceholderText("Buscar por nombre…")
+        contenido.addWidget(buscar)
+        lista = QListWidget()
+        self._configurar_tarjetas_voces(lista)
+        contenido.addWidget(lista, 1)
+        for hid, nombre, foto, encuadre in heroinas:
+            item = QListWidgetItem(self._icono_voz(foto, encuadre), nombre)
+            item.setData(Qt.ItemDataRole.UserRole, hid)
+            item.setToolTip(nombre)
+            lista.addItem(item)
+        def filtrar(texto):
+            aguja = texto.strip().casefold()
+            for i in range(lista.count()):
+                item = lista.item(i)
+                item.setHidden(aguja not in item.text().casefold())
+            actual = lista.currentItem()
+            if actual is None or actual.isHidden():
+                lista.setCurrentItem(next((lista.item(i) for i in range(lista.count())
+                                           if not lista.item(i).isHidden()), None))
+        buscar.textChanged.connect(filtrar)
+        acciones = QHBoxLayout()
+        acciones.addStretch(1)
+        cancelar = BotonAnimado("Cancelar")
+        cancelar.clicked.connect(dialogo.reject)
+        elegir = BotonAnimado("Asignar audio", primario=True)
+        def aceptar():
+            if lista.currentItem() is not None and not lista.currentItem().isHidden():
+                dialogo.accept()
+        elegir.clicked.connect(aceptar)
+        lista.itemActivated.connect(aceptar)
+        acciones.addWidget(cancelar)
+        acciones.addWidget(elegir)
+        contenido.addLayout(acciones)
+        lista.setCurrentRow(0)
+        buscar.setFocus()
+        return (lista.currentItem().data(Qt.ItemDataRole.UserRole)
+                if dialogo.exec() == QDialog.DialogCode.Accepted else None)
+
+    def cargar_voces(self, seleccion=None):
+        if self.juego_id is None:
+            return
+        filas = self.conn.execute("""
+            SELECT v.id, v.titulo, v.ruta, h.nombre, h.foto, h.foto_enc
+            FROM voces v LEFT JOIN heroinas h ON h.id = v.heroina_id
+            WHERE v.juego_id = ? ORDER BY h.orden, h.nombre COLLATE NOCASE, v.id
+        """, (self.juego_id,)).fetchall()
+        self.lista_voces.clear()
+        indice = 0
+        for i, (vid, titulo, ruta, heroina, foto, encuadre) in enumerate(filas):
+            nombre = heroina or "Heroína eliminada"
+            item = QListWidgetItem(self._icono_voz(foto, encuadre), f"{titulo}\n{nombre}")
+            item.setData(Qt.ItemDataRole.UserRole, ruta)
+            item.setData(Qt.ItemDataRole.UserRole + 1, vid)
+            item.setToolTip(f"{Path(ruta).name}\n{nombre}")
+            self.lista_voces.addItem(item)
+            if vid == seleccion:
+                indice = i
+        if filas:
+            self.lista_voces.setCurrentRow(indice)
+        self.estado_voces.setText("" if filas else "Adjunta un audio y selecciona a su heroína.")
+
+    def adjuntar_voz(self):
+        jid = self.juego_id
+        if jid is None:
+            return
+        heroinas = self.conn.execute("""
+            SELECT id, nombre, foto, foto_enc FROM heroinas
+            WHERE juego_id = ? AND nombre <> 'General'
+            ORDER BY orden, nombre
+        """, (jid,)).fetchall()
+        if not heroinas:
+            self.toast("Añade una heroína a la novela antes de adjuntar voces.")
+            return
+        archivo, _ = QFileDialog.getOpenFileName(
+            self, "Adjuntar audio de una heroína", str(ROOT), f"Audio ({EXT_AUDIO} *.aac *.opus)")
+        if not archivo or jid != self.juego_id:
+            return
+        origen = Path(archivo)
+        if origen.suffix.lower() not in {pat[1:] for pat in (EXT_AUDIO + " *.aac *.opus").split()}:
+            self.toast("Selecciona un archivo de audio compatible.")
+            return
+        elegida = self._elegir_heroina_voz(heroinas, origen.name)
+        if elegida is None or jid != self.juego_id:
+            return
+        carpeta = (ROOT / self.juego_carpeta / "Voces").resolve()
+        if not carpeta.is_relative_to(ROOT.resolve()):
+            self.toast("La carpeta de voces debe estar dentro de la biblioteca.")
+            return
+        destino = None
+        copiado = False
+        try:
+            carpeta.mkdir(parents=True, exist_ok=True)
+            destino = nombre_disponible(carpeta, origen.name)
+            copiado = self._copiar_con_progreso(origen, destino, "Adjuntando voz")
+            if not copiado:
+                return
+            with self.conn:
+                cursor = self.conn.execute(
+                    "INSERT INTO voces(juego_id, heroina_id, titulo, ruta) VALUES (?,?,?,?)",
+                    (jid, elegida, destino.stem, str(destino)))
+        except (OSError, sqlite3.Error):
+            if copiado:
+                destino.unlink(missing_ok=True)
+            self.toast("No se pudo adjuntar el audio.")
+            return
+        if jid == self.juego_id:
+            self.cargar_voces(cursor.lastrowid)
+        self.toast("Audio adjuntado.")
+
+    def _iniciar_reproductor_voces(self):
+        self.voces_player = QMediaPlayer(self)
+        self.voces_audio = QAudioOutput(self)
+        self.voces_audio.setVolume(self.volumen_voces.value() / 100)
+        self.voces_player.setAudioOutput(self.voces_audio)
+        self.voces_player.durationChanged.connect(self._progreso_voz)
+        self.voces_player.positionChanged.connect(self._progreso_voz)
+        self.voces_player.playbackStateChanged.connect(self._estado_reproductor_voz)
+        self.voces_player.errorOccurred.connect(
+            lambda *_: self.toast("No se pudo reproducir el archivo de audio."))
+
+    def reproducir_voz(self, item):
+        if item is None:
+            return
+        ruta = Path(item.data(Qt.ItemDataRole.UserRole))
+        if not ruta.is_file():
+            self.toast("El audio ya no está en el disco.")
+            return
+        if self.voces_player is None:
+            self._iniciar_reproductor_voces()
+        fuente = QUrl.fromLocalFile(str(ruta))
+        if self.voces_player.source() != fuente:
+            self.voces_player.setSource(fuente)
+        elif self.voces_player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.voces_player.setPosition(0)
+        self._opening_empezo()
+        self.player.pause()
+        self.voces_player.play()
+        self.estado_voces.setText(item.text().replace('\n', ' · '))
+
+    def _alternar_voz(self):
+        item = self.lista_voces.currentItem()
+        if item and self.voces_player is not None:
+            fuente = QUrl.fromLocalFile(item.data(Qt.ItemDataRole.UserRole))
+            if (self.voces_player.source() == fuente and
+                    self.voces_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState):
+                self.voces_player.pause()
+                return
+        self.reproducir_voz(item)
+
+    def _estado_reproductor_voz(self, estado):
+        sonando = estado == QMediaPlayer.PlaybackState.PlayingState
+        self.btn_voz.setText("⏸ Pausar" if sonando else "▶ Reproducir")
+
+    def _progreso_voz(self, _):
+        pos = self.voces_player.position()
+        dur = self.voces_player.duration()
+        self.posicion_voces.setMaximum(dur)
+        if not self.posicion_voces.isSliderDown():
+            self.posicion_voces.setValue(pos)
+        self.tiempo_voces.setText(f"{self.formato_tiempo(pos)} / {self.formato_tiempo(dur)}")
+
+    def _detener_voces(self):
+        if self.voces_player is not None:
+            self.voces_player.stop()
+            self.voces_player.setSource(QUrl())
+            self.estado_voces.clear()
+
+    def _renombrar_adjunto(self, tabla):
+        es_clip = tabla == "clips"
+        lista = self.lista_clips if es_clip else self.lista_voces
+        item = lista.currentItem()
+        if item is None:
+            self.toast("Selecciona el archivo que quieres renombrar.")
+            return
+        jid = self.juego_id
+        vid = item.data(Qt.ItemDataRole.UserRole + 1)
+        fila = self.conn.execute(
+            f"SELECT ruta FROM {tabla} WHERE id=? AND juego_id=?", (vid, jid)).fetchone()
+        if not fila:
+            return
+        ruta = Path(fila[0])
+        nombre, ok = QInputDialog.getText(
+            self, "Renombrar archivo", "Nuevo nombre sin la extensión", text=ruta.stem)
+        if not ok or jid != self.juego_id:
+            return
+        nombre = nombre.strip().rstrip(". ")
+        if nombre.lower().endswith(ruta.suffix.lower()):
+            nombre = nombre[:-len(ruta.suffix)].rstrip(". ")
+        if not nombre or nombre != nombre_seguro(nombre) or Path(nombre).is_reserved():
+            self.toast("Escribe un nombre de archivo válido.")
+            return
+        destino = ruta.with_name(nombre + ruta.suffix)
+        if destino.name == ruta.name:
+            return
+        carpeta = (ROOT / self.juego_carpeta / ("Clips" if es_clip else "Voces")).resolve()
+        if not carpeta.is_relative_to(ROOT.resolve()) or ruta.resolve().parent != carpeta or not ruta.is_file():
+            self.toast("El archivo no está en la carpeta de la novela.")
+            return
+        if destino.exists() and destino != ruta:
+            self.toast("Ya existe un archivo con ese nombre.")
+            return
+        if es_clip and self.clips_reproductor is not None:
+            self.clips_reproductor.soltar()
+        elif not es_clip:
+            self._detener_voces()
+        cambio = False
+        try:
+            with self.conn:
+                ruta.rename(destino)
+                cambio = True
+                self.conn.execute(f"UPDATE {tabla} SET titulo=?, ruta=? WHERE id=? AND juego_id=?",
+                                  (nombre, str(destino), vid, jid))
+        except (OSError, sqlite3.Error):
+            if cambio:
+                destino.rename(ruta)
+            self.toast("No se pudo renombrar el archivo.")
+            return
+        cargar = self.cargar_clips if es_clip else self.cargar_voces
+        cargar(vid)
+        self.toast(f"Archivo renombrado a «{destino.name}».")
+
     def _al_cambiar_pestana_juego(self, i):
+        if i == self.IDX_VOCES:
+            self.cargar_voces()
+        else:
+            self._detener_voces()
+        if i == self.IDX_CLIPS:
+            self.cargar_clips()
+        else:
+            self._detener_clips()
+        if i == 1:
+            self.cargar_musica()
+        if i == self.IDX_FICHA:
+            self.cargar_ficha_novela()
+        elif self.guia_pdf.status() != QPdfDocument.Status.Null:
+            self.guia_pdf.close()
         if i == self.IDX_TOP:
             self.cargar_top()
         if i == self.IDX_OPENINGS:
-            if self.chk_auto_op.isChecked() and not self.opening.sonando():
-                self.opening.iniciar()                # solo si lo activaste tú
-            else:
-                self.opening.reanudar()
+            self.cargar_openings()
+            self.opening.reanudar()
         else:
             self.opening.pausar_por_pestana()
 
@@ -17571,344 +18523,216 @@ class NyuhuhuGallery(QMainWindow):
         self.ir_a_pagina(self.PAG_OPENINGS)
 
     def construir_openings_global(self):
-        self._ops, self._ops_orden, self._cola_ids = {}, [], []
+        self._ops = {}
+        self._ops_rutas = {}
+        self._ultimos_openings = []
+        self._seleccion_openings = []
+        self._opening_en_pantalla = None
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
-
         fila = QHBoxLayout()
         volver = BotonAnimado("← Biblioteca")
         volver.clicked.connect(self.volver_biblioteca)
         fila.addWidget(volver)
-        col = QVBoxLayout()
-        t = QLabel("🎬 Openings")
-        t.setObjectName("heading")
-        self.lbl_op_global = QLabel("")
-        self.lbl_op_global.setObjectName("muted")
-        col.addWidget(t)
-        col.addWidget(self.lbl_op_global)
-        fila.addLayout(col, 1)
-        self.orden_op = QComboBox()
-        self.orden_op.addItems(["Por novela", "Nombre A-Z", "Me gustan primero",
-                                "Solo los que me gustan"])
-        self.orden_op.currentTextChanged.connect(lambda *_: self._pintar_lista_ops())
-        fila.addWidget(self.orden_op)
-        self.buscar_op = QLineEdit()
-        self.buscar_op.setPlaceholderText("⌕  Buscar opening o novela...")
-        self.buscar_op.setMinimumWidth(220)
-        self._t_busq_op = QTimer(self)
-        self._t_busq_op.setSingleShot(True)
-        self._t_busq_op.setInterval(180)
-        self._t_busq_op.timeout.connect(self._pintar_lista_ops)
-        self.buscar_op.textChanged.connect(lambda *_: self._t_busq_op.start())
-        fila.addWidget(self.buscar_op)
+        titulo = QLabel("Sala de openings")
+        titulo.setObjectName("heading")
+        fila.addWidget(titulo, 1)
         v.addLayout(fila)
 
-        sp = QSplitter(Qt.Orientation.Horizontal)
-        sp.setChildrenCollapsible(False)
-
-        # ---- izquierda: todos los openings
-        izq = QFrame()
-        izq.setObjectName("panel")
-        izq.setMinimumWidth(340)
-        il = QVBoxLayout(izq)
-        il.setContentsMargins(12, 12, 12, 12)
-        h1 = QLabel("Todos mis openings")
-        h1.setObjectName("heading")
-        il.addWidget(h1)
-        self.lista_op_todos = QListWidget()
-        self.lista_op_todos.setUniformItemSizes(True)
-        self.lista_op_todos.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.lista_op_todos.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.lista_op_todos.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.lista_op_todos.customContextMenuRequested.connect(
-            lambda p: self._menu_op(self.lista_op_todos, p, False))
-        self.lista_op_todos.itemDoubleClicked.connect(self._op_doble_clic)
-        self.lista_op_todos.setToolTip("Doble clic: añadirlo a tu lista y verlo · "
-                                       "clic derecho: más opciones")
-        il.addWidget(self.lista_op_todos, 1)
-        cuad = QGridLayout()
-        b_gusta = BotonAnimado("♥ Me gusta")
-        b_gusta.setToolTip("Marca o desmarca los seleccionados como «me gusta»")
-        b_gusta.clicked.connect(
-            lambda: self._alternar_me_gusta(self._ids_sel(self.lista_op_todos)))
-        b_add = BotonAnimado("＋ A mi lista", primario=True)
-        b_add.clicked.connect(
-            lambda: self._anadir_a_cola(self._ids_sel(self.lista_op_todos)))
-        b_favs = BotonAnimado("＋ Los que me gustan")
-        b_favs.clicked.connect(self._anadir_favoritos_a_cola)
-        b_todos = BotonAnimado("＋ Todos")
-        b_todos.clicked.connect(lambda: self._anadir_a_cola(list(self._ops_orden)))
-        cuad.addWidget(b_gusta, 0, 0)
-        cuad.addWidget(b_add, 0, 1)
-        cuad.addWidget(b_favs, 1, 0)
-        cuad.addWidget(b_todos, 1, 1)
-        il.addLayout(cuad)
-        sp.addWidget(izq)
-
-        # ---- derecha: pantalla grande + mi lista
-        der = QWidget()
-        dl = QVBoxLayout(der)
-        dl.setContentsMargins(0, 0, 0, 0)
+        cuerpo = QHBoxLayout()
+        cuerpo.setSpacing(10)
+        escenario = QFrame()
+        escenario.setObjectName("panel")
+        zona = QVBoxLayout(escenario)
+        zona.setContentsMargins(10, 8, 10, 8)
         self.opening_global = self._nuevo_reproductor_opening()
-        self.opening_global.indice_cambiado.connect(
-            lambda i: self._marcar_fila(self.lista_op_cola, i))
-        cola = QFrame()
-        cola.setObjectName("panel")
-        cl = QVBoxLayout(cola)
-        cl.setContentsMargins(12, 10, 12, 10)
-        h2 = QLabel("▶ Mi lista · arrástrala para cambiar el orden")
-        h2.setObjectName("heading")
-        cl.addWidget(h2)
-        self.lista_op_cola = QListWidget()
-        self.lista_op_cola.setUniformItemSizes(True)
-        self.lista_op_cola.setMinimumHeight(110)
-        self.lista_op_cola.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.lista_op_cola.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.lista_op_cola.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.lista_op_cola.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.lista_op_cola.model().rowsMoved.connect(
-            lambda *a: QTimer.singleShot(0, self._cola_reordenada))
-        self.lista_op_cola.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.lista_op_cola.customContextMenuRequested.connect(
-            lambda p: self._menu_op(self.lista_op_cola, p, True))
-        self.lista_op_cola.itemDoubleClicked.connect(
-            lambda it: self._reproducir_cola(self.lista_op_cola.row(it)))
-        cl.addWidget(self.lista_op_cola, 1)
-        bf = QHBoxLayout()
-        b_play = BotonAnimado("▶ Reproducir lista", primario=True)
-        b_play.clicked.connect(lambda: self._reproducir_cola(0))
-        b_mez = BotonAnimado("🔀 Mezclar")
-        b_mez.clicked.connect(self._mezclar_cola)
-        b_quitar = BotonAnimado("✖ Quitar")
-        b_quitar.clicked.connect(
-            lambda: self._quitar_de_cola(self._ids_sel(self.lista_op_cola)))
-        b_vaciar = BotonAnimado("🗑 Vaciar lista")
-        b_vaciar.clicked.connect(lambda: self._set_cola([]))
-        for b in (b_play, b_mez, b_quitar, b_vaciar):
-            bf.addWidget(b)
-        cl.addLayout(bf)
-        sv = QSplitter(Qt.Orientation.Vertical)
-        sv.setChildrenCollapsible(False)
-        sv.addWidget(self.opening_global)
-        sv.addWidget(cola)
-        sv.setStretchFactor(0, 3)
-        sv.setStretchFactor(1, 1)
-        dl.addWidget(sv)
-        sp.addWidget(der)
-        sp.setStretchFactor(0, 0)
-        sp.setStretchFactor(1, 1)
-        sp.setSizes([430, 900])
-        v.addWidget(sp, 1)
+        self.opening_global.empezo.connect(self._registrar_opening_visto)
+        zona.addWidget(self.opening_global, 1)
+        self.lbl_op_actual = QLabel("Elige un opening del catálogo")
+        self.lbl_op_actual.setObjectName("heading")
+        self.lbl_op_actual.setWordWrap(True)
+        self.lbl_op_novela = QLabel("")
+        self.lbl_op_novela.setObjectName("muted")
+        descripcion = QHBoxLayout()
+        textos = QVBoxLayout()
+        textos.setSpacing(2)
+        textos.addWidget(self.lbl_op_actual)
+        textos.addWidget(self.lbl_op_novela)
+        descripcion.addLayout(textos, 1)
+        salir = self._boton_cerrar_video(self.opening_global)
+        descripcion.addWidget(salir)
+        zona.addLayout(descripcion)
+        cuerpo.addWidget(escenario, 1)
+
+        panel = QFrame()
+        panel.setObjectName("panel")
+        panel.setMinimumWidth(300)
+        panel.setMaximumWidth(395)
+        catalogo = QVBoxLayout(panel)
+        catalogo.setContentsMargins(10, 10, 10, 10)
+        self.buscar_op = QLineEdit()
+        self.buscar_op.setPlaceholderText("Buscar por opening o novela")
+        catalogo.addWidget(self.buscar_op)
+        self.filtro_op = QComboBox()
+        self.filtro_op.addItems(["Todos los openings", "Favoritos", "Vistos recientemente",
+                                 "Selección guardada"])
+        catalogo.addWidget(self.filtro_op)
+        self.lista_op_todos = QListWidget()
+        self.lista_op_todos.setItemDelegate(DelegadoCatalogoOpening(self.lista_op_todos))
+        self.lista_op_todos.setUniformItemSizes(True)
+        self.lista_op_todos.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.lista_op_todos.itemActivated.connect(self._op_doble_clic)
+        self.lista_op_todos.setToolTip("Doble clic o Enter para ver. Esc para salir del video.")
+        catalogo.addWidget(self.lista_op_todos, 1)
+        self.lbl_op_global = QLabel("")
+        self.lbl_op_global.setObjectName("muted")
+        self.lbl_op_global.setWordWrap(True)
+        catalogo.addWidget(self.lbl_op_global)
+        acciones = QHBoxLayout()
+        self.btn_ver_op = BotonAnimado("▶ Reproducir", primario=True)
+        self.btn_ver_op.clicked.connect(self._op_ver_seleccionado)
+        self.btn_ver_op.setToolTip("Reproducir el opening seleccionado (Enter)")
+        self.btn_fav_op = BotonAnimado("♡ Favorito")
+        self.btn_fav_op.clicked.connect(self._op_favorito_seleccionado)
+        acciones.addWidget(self.btn_ver_op, 1)
+        acciones.addWidget(self.btn_fav_op)
+        catalogo.addLayout(acciones)
+        cuerpo.addWidget(panel)
+        v.addLayout(cuerpo, 1)
+        self.lista_op_todos.currentItemChanged.connect(self._actualizar_acciones_opening)
+        self.opening_global.reposo.clic.disconnect(self.opening_global.alternar_play)
+        self.opening_global.reposo.clic.connect(self._op_ver_seleccionado)
+        self.opening_global.player.sourceChanged.connect(self._actualizar_acciones_opening)
+        self.buscar_op.textChanged.connect(self._pintar_lista_ops)
+        self.filtro_op.currentIndexChanged.connect(self._pintar_lista_ops)
+        self._actualizar_acciones_opening()
         return w
 
-    # ---------- datos
+    def _ids_openings_guardados(self, clave):
+        fila = self.conn.execute("SELECT valor FROM ajustes WHERE clave=?", (clave,)).fetchone()
+        try:
+            ids = json.loads(fila[0]) if fila else []
+        except (ValueError, TypeError):
+            return []
+        return list(dict.fromkeys(i for i in ids if type(i) is int and i in self._ops)) \
+            if isinstance(ids, list) else []
 
     def cargar_openings_global(self):
         filas = self.conn.execute("""
-            SELECT v.id, v.titulo, v.ruta, j.nombre, v.me_gusta
+            SELECT v.id, v.titulo, v.ruta, j.nombre, v.me_gusta, j.portada, j.portada_enc
             FROM videos v JOIN juegos j ON j.id = v.juego_id
             ORDER BY j.orden, j.nombre COLLATE NOCASE, v.orden, v.id""").fetchall()
-        self._ops = {f[0]: dict(id=f[0], titulo=f[1], ruta=f[2], novela=f[3],
-                                me_gusta=int(f[4] or 0)) for f in filas}
-        self._ops_orden = [f[0] for f in filas]
-        try:
-            g = self.conn.execute(
-                "SELECT valor FROM ajustes WHERE clave = 'openings_lista'").fetchone()
-            ids = json.loads(g[0]) if g else []
-        except (sqlite3.Error, ValueError, TypeError):
-            ids = []
-        self._cola_ids = self._limpiar_ids([i for i in ids if isinstance(i, int)])
+        self._ops = {i: dict(titulo=titulo, ruta=ruta, novela=novela, favorito=bool(fav),
+                             portada=portada, enc=parse_enc(enc))
+                     for i, titulo, ruta, novela, fav, portada, enc in filas}
+        self._ops_rutas = {d["ruta"]: i for i, d in self._ops.items()}
+        self._ultimos_openings = self._ids_openings_guardados("openings_recientes")
+        self._seleccion_openings = self._ids_openings_guardados("openings_lista")
         self._pintar_lista_ops()
-        self._pintar_cola_ops()
-        self._sincronizar_cola()
 
-    def _limpiar_ids(self, ids):
-        vistos, limpio = set(), []
-        for i in ids:
-            if i in self._ops and i not in vistos:
-                vistos.add(i)
-                limpio.append(i)
-        return limpio
+    def _pintar_lista_ops(self, *_):
+        filtro = self.buscar_op.text().strip().casefold()
+        modo = self.filtro_op.currentIndex()
+        ids = self._ops
+        if modo == 1:
+            ids = [i for i, datos in self._ops.items() if datos["favorito"]]
+        elif modo == 2:
+            ids = self._ultimos_openings
+        elif modo == 3:
+            ids = self._seleccion_openings
 
-    def _texto_op(self, d):
-        return f"{'♥' if d['me_gusta'] else '♡'}   {d['titulo']}      ·      {d['novela']}"
-
-    def _ids_sel(self, lista):
-        return [it.data(Qt.ItemDataRole.UserRole) for it in lista.selectedItems()]
-
-    def _actualizar_total_ops(self):
-        n = len(self._ops)
-        gustan = sum(1 for d in self._ops.values() if d["me_gusta"])
-        self.lbl_op_global.setText(
-            f"{n} opening(s) · ♥ {gustan} me gustan · {len(self._cola_ids)} en tu lista"
-            if n else "Aún no tienes openings: súbelos desde la pestaña Openings de cada novela")
-
-    def _pintar_lista_ops(self):
-        filtro = self.buscar_op.text().casefold().strip()
-        modo = self.orden_op.currentText()
-        ids = [i for i in self._ops_orden
-               if not filtro or filtro in (self._ops[i]["titulo"] + " "
-                                           + self._ops[i]["novela"]).casefold()]
-        if modo == "Nombre A-Z":
-            ids.sort(key=lambda i: clave_alfabetica(self._ops[i]["titulo"]))
-        elif modo == "Me gustan primero":
-            ids.sort(key=lambda i: not self._ops[i]["me_gusta"])
-        elif modo == "Solo los que me gustan":
-            ids = [i for i in ids if self._ops[i]["me_gusta"]]
         lista = self.lista_op_todos
+        anterior = lista.currentItem()
+        elegir = anterior.data(Qt.ItemDataRole.UserRole) if anterior else self._opening_en_pantalla
+        previo = lista.blockSignals(True)
         lista.setUpdatesEnabled(False)
         lista.clear()
         for i in ids:
-            it = QListWidgetItem(self._texto_op(self._ops[i]))
+            datos = self._ops[i]
+            if filtro and filtro not in (datos["titulo"] + " " + datos["novela"]).casefold():
+                continue
+            it = QListWidgetItem(datos["titulo"])
             it.setData(Qt.ItemDataRole.UserRole, i)
-            it.setToolTip(self._ops[i]["ruta"])
-            it.setSizeHint(QSize(0, 32))
+            it.setData(Qt.ItemDataRole.UserRole + 1, datos)
+            it.setToolTip(f"{datos['titulo']} · {datos['novela']}")
             lista.addItem(it)
+            if i == elegir:
+                lista.setCurrentItem(it)
+        if lista.currentRow() < 0 and lista.count():
+            lista.setCurrentRow(0)
         lista.setUpdatesEnabled(True)
-        self._actualizar_total_ops()
+        lista.blockSignals(previo)
+        self.lbl_op_global.setText(
+            "Sin resultados" if not lista.count() and (filtro or modo)
+            else "Adjunta videos desde la pestaña Openings de una novela" if not lista.count()
+            else "")
+        self._actualizar_acciones_opening()
 
-    def _pintar_cola_ops(self):
-        lista = self.lista_op_cola
-        lista.setUpdatesEnabled(False)
-        lista.clear()
-        for n, i in enumerate(self._cola_ids, 1):
-            d = self._ops[i]
-            it = QListWidgetItem(f"{n}.   {d['titulo']}      ·      {d['novela']}")
-            it.setData(Qt.ItemDataRole.UserRole, i)
-            it.setToolTip(d["ruta"])
-            it.setSizeHint(QSize(0, 32))
-            lista.addItem(it)
-        lista.setUpdatesEnabled(True)
+    def _actualizar_acciones_opening(self, *_):
+        item = self.lista_op_todos.currentItem()
+        datos = self._ops.get(item.data(Qt.ItemDataRole.UserRole)) if item else None
+        if self.opening_global.player.source().isEmpty():
+            self.lbl_op_actual.setText(datos["titulo"] if datos else "Elige un opening del catálogo")
+            self.lbl_op_novela.setText(datos["novela"] if datos else "")
+        self.btn_ver_op.setEnabled(datos is not None)
+        self.btn_fav_op.setEnabled(datos is not None)
+        self.btn_fav_op.setText("♥ Favorito" if datos and datos["favorito"] else "♡ Favorito")
 
-    # ---------- «me gusta» y mi lista
-
-    def _alternar_me_gusta(self, ids):
-        ids = [i for i in ids if i in self._ops]
-        if not ids:
-            self.toast("Selecciona uno o más openings")
-            return
-        nuevo = 0 if all(self._ops[i]["me_gusta"] for i in ids) else 1
-        self.conn.executemany("UPDATE videos SET me_gusta = ? WHERE id = ?",
-                              [(nuevo, i) for i in ids])
-        self.conn.commit()
-        for i in ids:
-            self._ops[i]["me_gusta"] = nuevo
-        if self.orden_op.currentText() in ("Me gustan primero", "Solo los que me gustan"):
-            self._pintar_lista_ops()
-        else:
-            lista = self.lista_op_todos
-            for r in range(lista.count()):
-                it = lista.item(r)
-                it.setText(self._texto_op(self._ops[it.data(Qt.ItemDataRole.UserRole)]))
-            self._actualizar_total_ops()
-
-    def _set_cola(self, ids):
-        self._cola_ids = self._limpiar_ids(ids)
-        guardar_ajuste(self.conn, "openings_lista", json.dumps(self._cola_ids))
-        self._pintar_cola_ops()
-        self._sincronizar_cola()
-        self._actualizar_total_ops()
-
-    def _sincronizar_cola(self):
-        """La pantalla siempre tiene cargada tu lista (apagada hasta que pulses ▶)."""
-        ids = self._cola_ids
-        self.opening_global.cargar([self._ops[i]["ruta"] for i in ids], False, False,
-                                   [self._ops[i]["titulo"] for i in ids])
-
-    def _anadir_a_cola(self, ids):
-        nuevos = [i for i in ids if i in self._ops and i not in self._cola_ids]
-        if not ids:
-            self.toast("Selecciona uno o más openings")
-            return
-        if not nuevos:
-            self.toast("Ya están en tu lista")
-            return
-        self._set_cola(self._cola_ids + nuevos)
-        self.toast(f"＋ {len(nuevos)} opening(s) añadidos a tu lista")
-
-    def _anadir_favoritos_a_cola(self):
-        favs = [i for i in self._ops_orden if self._ops[i]["me_gusta"]]
-        if not favs:
-            self.toast("Aún no marcaste ninguno con ♥")
-            return
-        self._anadir_a_cola(favs)
-
-    def _quitar_de_cola(self, ids):
-        if not ids:
-            return
-        self._set_cola([i for i in self._cola_ids if i not in set(ids)])
-
-    def _mezclar_cola(self):
-        ids = list(self._cola_ids)
-        random.shuffle(ids)
-        self._set_cola(ids)
-
-    def _cola_reordenada(self):
-        lista = self.lista_op_cola
-        ids = [lista.item(r).data(Qt.ItemDataRole.UserRole) for r in range(lista.count())]
-        if ids != self._cola_ids:
-            self._set_cola(ids)
-
-    def _reproducir_cola(self, desde=0):
-        ids = self._cola_ids
-        if not ids:
-            self.toast("Tu lista está vacía: añade openings con ＋ o con doble clic")
-            return
-        self.opening_global.cargar([self._ops[i]["ruta"] for i in ids], True, True,
-                                   [self._ops[i]["titulo"] for i in ids], desde)
+    def _op_ver_seleccionado(self):
+        item = self.lista_op_todos.currentItem()
+        if item is not None:
+            self._op_doble_clic(item)
 
     def _op_doble_clic(self, item):
-        i = item.data(Qt.ItemDataRole.UserRole)
-        if i not in self._cola_ids:
-            self._set_cola(self._cola_ids + [i])
-        self._reproducir_cola(self._cola_ids.index(i))
+        vid = item.data(Qt.ItemDataRole.UserRole)
+        datos = self._ops[vid]
+        if not Path(datos["ruta"]).is_file():
+            self.toast("El archivo de video ya no está en el disco.")
+            return
+        ids = [self.lista_op_todos.item(i).data(Qt.ItemDataRole.UserRole)
+               for i in range(self.lista_op_todos.count())]
+        disponibles = [i for i in ids if i == vid or Path(self._ops[i]["ruta"]).is_file()]
+        self.opening_global.cargar(
+            [self._ops[i]["ruta"] for i in disponibles], True, True,
+            [self._ops[i]["titulo"] for i in disponibles], disponibles.index(vid)
+        )
 
-    def _menu_op(self, lista, punto, es_cola):
-        it = lista.itemAt(punto)
-        if it is None:
+    @staticmethod
+    def _ruta_opening_actual(reproductor):
+        if 0 <= reproductor._idx < len(reproductor._rutas):
+            return reproductor._rutas[reproductor._idx]
+        return ""
+
+    def _registrar_opening_visto(self):
+        vid = self._ops_rutas.get(self._ruta_opening_actual(self.opening_global))
+        if vid is None:
             return
-        if not it.isSelected():
-            lista.clearSelection()
-            it.setSelected(True)
-        ids = self._ids_sel(lista)
-        vid = it.data(Qt.ItemDataRole.UserRole)
-        d = self._ops.get(vid)
-        if d is None:
-            return
-        m = QMenu(self)
-        a_ver = m.addAction("▶ Ver desde aquí" if es_cola else "▶ Ver ahora")
-        a_gus = m.addAction("♡ Quitar «me gusta»" if d["me_gusta"] else "♥ Me gusta")
-        a_add = a_quit = None
-        if es_cola:
-            a_quit = m.addAction("✖ Quitar de mi lista")
-        else:
-            a_add = m.addAction("＋ Añadir a mi lista")
-        m.addSeparator()
-        a_ren = m.addAction("✎ Renombrar")
-        a_ubi = m.addAction("📂 Abrir ubicación del archivo")
-        m.addSeparator()
-        a_del = m.addAction("🗑 Eliminar permanentemente")
-        acc = m.exec(lista.viewport().mapToGlobal(punto))
-        if acc is None:
-            return
-        if acc == a_ver:
-            if es_cola:
-                self._reproducir_cola(lista.row(it))
-            else:
-                self._op_doble_clic(it)
-        elif acc == a_gus:
-            self._alternar_me_gusta(ids)
-        elif acc == a_add:
-            self._anadir_a_cola(ids)
-        elif acc == a_quit:
-            self._quitar_de_cola(ids)
-        elif acc == a_ren:
-            self.renombrar_opening(vid)
-        elif acc == a_ubi:
-            self.ubicacion_opening(vid)
-        elif acc == a_del:
-            self.eliminar_opening(vid)
+        info = self._ops[vid]
+        self._opening_en_pantalla = vid
+        self.lbl_op_actual.setText(info["titulo"])
+        self.lbl_op_novela.setText(info["novela"])
+        if self._ultimos_openings[:1] != [vid]:
+            anteriores = [i for i in self._ultimos_openings if i != vid]
+            self._ultimos_openings = [vid] + anteriores[:29]
+            guardar_ajuste(self.conn, "openings_recientes", json.dumps(self._ultimos_openings))
+            if self.filtro_op.currentIndex() == 2:
+                self._pintar_lista_ops()
+        for fila in range(self.lista_op_todos.count()):
+            if self.lista_op_todos.item(fila).data(Qt.ItemDataRole.UserRole) == vid:
+                self.lista_op_todos.setCurrentRow(fila)
+                break
+
+    def _marcar_opening_favorito(self, vid):
+        self.conn.execute(
+            "UPDATE videos SET me_gusta = 1 - COALESCE(me_gusta, 0) WHERE id=?", (vid,))
+        self.conn.commit()
+
+    def _op_favorito_seleccionado(self):
+        item = self.lista_op_todos.currentItem()
+        if item is not None:
+            self._marcar_opening_favorito(item.data(Qt.ItemDataRole.UserRole))
+            self.cargar_openings_global()
 
     def menu_musica(self, punto):
         it = self.lista_musica.itemAt(punto)
@@ -18008,16 +18832,26 @@ class NyuhuhuGallery(QMainWindow):
             resto = [f for f in filas if not f[7] and not f[8]]
             filas = actuales + terminadas + resto
         self._filas_bib = filas
-        tarjetas = []
-        nueva = TarjetaJuego(nueva=True)
-        nueva.clic.connect(lambda _id: self.anadir_juego())
-        tarjetas.append(nueva)
+        cache = self.__dict__.setdefault("_tarjetas_bib", {})
+        vigentes = {f[0] for f in todas} | {-1}
+        for fuera in cache.keys() - vigentes:
+            cache.pop(fuera).deleteLater()
+        if -1 not in cache:
+            nueva = cache[-1] = TarjetaJuego(nueva=True)
+            nueva.clic.connect(lambda _id: self.anadir_juego())
+        tarjetas = [cache[-1]]
         for jid, nombre, portada, n, enc, _nh, _hr, _fi, _ff in filas:
             if filtro and filtro not in nombre.casefold():
                 continue
-            t = TarjetaJuego(jid, nombre, portada, n, enc=parse_enc(enc))
-            t.clic.connect(self.entrar_juego)
-            t.menu.connect(self.menu_juego)
+            encuadre = parse_enc(enc)
+            t = cache.get(jid)
+            if t is None:
+                t = cache[jid] = TarjetaJuego(jid, nombre, portada, n, enc=encuadre)
+                t.clic.connect(self.entrar_juego)
+                t.menu.connect(self.menu_juego)
+            elif (t.nombre, t.portada, t.cantidad, t.enc) != (nombre, portada, n, encuadre):
+                t.nombre, t.portada, t.cantidad, t.enc = nombre, portada, n, encuadre
+                t.update()
             tarjetas.append(t)
         self.grid_juegos.poner(tarjetas)
         self.lbl_bib.setText(
@@ -18146,6 +18980,8 @@ class NyuhuhuGallery(QMainWindow):
     def _soltar_audio(self):
         """Libera los archivos de música (Windows no deja renombrar/borrar archivos en uso)."""
         self._detener_musica()
+        self._cancelar_normalizacion()
+        self._timer_mp3.start(50)
         self._soltar_openings(procesar=False)
         QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
@@ -18272,8 +19108,6 @@ class NyuhuhuGallery(QMainWindow):
         self.refrescar_fechas_novela()
         self.refrescar_nota_novela()
         self.cover_musica.poner(fila[1], fila[0], parse_enc(fila[2]))
-        self.cover_openings.poner(fila[1], fila[0], parse_enc(fila[2]))
-        self.buscar_imagen.clear()
         self.buscar_pista.clear()
 
         huerfanas = self.conn.execute(
@@ -18291,8 +19125,6 @@ class NyuhuhuGallery(QMainWindow):
         self.ir_a_pagina(1)
         self.tabs_juego.setCurrentIndex(0)
         self.cargar_heroinas()
-        self.cargar_musica()
-        self.cargar_openings()                        # lista lista; el video empieza apagado
         self._nav_diferido()
 
         if self.total_personajes() == 0:
@@ -18609,7 +19441,7 @@ class NyuhuhuGallery(QMainWindow):
         for hid, nombre, foto, enc_txt, alt, cumple, seiyuu, tipo, bus, cin, cad, apodos in filas:
             lista = destino.get(tipo, self.lista_heroinas)
             enc = parse_enc(enc_txt)
-            it = QListWidgetItem(QIcon(avatar(foto, 52, enc)), nombre)
+            it = QListWidgetItem(nombre)
             it.setData(Qt.ItemDataRole.UserRole,
                        {"id": hid, "nombre": nombre, "foto": foto, "enc": enc,
                         "altura": alt or 0, "busto": bus or 0, "cintura": cin or 0,
@@ -18635,7 +19467,8 @@ class NyuhuhuGallery(QMainWindow):
             etq.setText(str(lista_p.count()))
         self.ajustar_listas_pers()
         self.al_cambiar_heroina(elegido[1] if elegido else None)
-        self.cargar_top()
+        if self.tabs_juego.currentIndex() == self.IDX_TOP:
+            self.cargar_top()
 
     def _leer_orden_paneles(self):
         base = ["heroina", "sub", "secundaria"]
@@ -21717,15 +22550,19 @@ class NyuhuhuGallery(QMainWindow):
         self.cargando = True
         try:
             self.actualizar_titulos_tabs()
-            for l in self.listas:
-                l.clear()
+            lista = self.lista_actual()
+            if self._galeria_id != self.heroina_id:
+                for l in self.listas:
+                    l.clear()
+                self._galeria_id = self.heroina_id
+            else:
+                lista.clear()
             if self.juego_id is None or self.heroina_id is None:
                 self.estadisticas.setText(
                     "Los personajes secundarios son solo de vista: no tienen capturas."
                     if self._sel_secundaria else "Selecciona una heroína para ver sus capturas.")
                 return
 
-            filtro = self.buscar_imagen.text().casefold().strip()
             categoria = self.categoria_actual()
             orden = self.modo_orden_vista()          # el orden de ESTA heroína + categoría
             if self.orden.currentText() != orden:
@@ -21748,17 +22585,10 @@ class NyuhuhuGallery(QMainWindow):
             filas = self.conn.execute(
                 consulta, (self.juego_id, self.heroina_id, categoria)).fetchall()
 
-            lista = self.lista_actual()
             self.delegado.tam = QSize(0, 0)  # fuerza recalcular rejilla
             lista.setGridSize(QSize(0, 0))
             visibles = 0
             for imagen_id, ruta, cat, fav, etiquetas, coment, ntit in filas:
-                if filtro and filtro not in (etiquetas or "").casefold() \
-                        and filtro not in (coment or "").casefold() \
-                        and filtro not in (ntit or "").casefold():
-                    continue
-                if not Path(ruta).exists():
-                    continue
                 item = QListWidgetItem()
                 item.setData(Qt.ItemDataRole.UserRole, {
                     "id": imagen_id, "ruta": ruta, "categoria": cat,
@@ -21811,9 +22641,6 @@ class NyuhuhuGallery(QMainWindow):
         self.actualizar_galeria()
 
     def guardar_orden_galeria(self, ids):
-        if self.buscar_imagen.text().strip():
-            self.toast("Borra la búsqueda para poder ordenar a mano")
-            return
         for pos, iid in enumerate(ids, 1):
             self.conn.execute("UPDATE imagenes SET orden = ? WHERE id = ?", (pos, iid))
         self.conn.commit()
@@ -22031,9 +22858,9 @@ class NyuhuhuGallery(QMainWindow):
     # -----------------------------------------------------
 
     def enfocar_busqueda(self):
-        campo = self.buscar_imagen if self.pila.currentIndex() == 1 else self.buscar_juego
-        campo.setFocus()
-        campo.selectAll()
+        if self.pila.currentIndex() == 0:
+            self.buscar_juego.setFocus()
+            self.buscar_juego.selectAll()
 
     def seleccionar_todas(self):
         if self.pila.currentIndex() == 1:
@@ -22044,7 +22871,7 @@ class NyuhuhuGallery(QMainWindow):
             self.lista_actual().clearSelection()
 
     def closeEvent(self, event):
-        for paso in (self._detener_musica, self.opening.detener, self.opening_global.detener,
+        for paso in (self._cerrar_audio, self.guia_pdf.close, self._detener_clips, self._detener_voces, self.opening.detener, self.opening_global.detener,
                      self.guardar_pendientes,
                      self.conn.close):
             try:
