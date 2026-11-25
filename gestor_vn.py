@@ -28,7 +28,7 @@ from PIL import Image
 from PySide6.QtCore import (
     Qt, QSize, QRectF, QPointF, QPoint, QRect, Signal, QTimer, QUrl, QVariantAnimation,
     QEasingCurve, QEvent, QPropertyAnimation, QMimeData, QObject, QDate,
-    QRunnable, QThreadPool, QEventLoop, QProcess,
+    QRunnable, QThreadPool, QEventLoop, QProcess, QItemSelectionModel,
     qInstallMessageHandler, QtMsgType
 )
 from PySide6.QtGui import (
@@ -615,6 +615,27 @@ def conectar():
 
     limpiar_duelos_antiguos(conn)
     conn.commit()
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        migrar_voces = not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='voces_personajes'"
+        ).fetchone()
+        for tabla in ("clips", "voces"):
+            if "incognito" not in columnas(tabla):
+                conn.execute(f"ALTER TABLE {tabla} ADD COLUMN incognito INTEGER NOT NULL DEFAULT 0")
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {tabla}_personajes (
+                    adjunto_id INTEGER NOT NULL REFERENCES {tabla}(id) ON DELETE CASCADE,
+                    heroina_id INTEGER NOT NULL REFERENCES heroinas(id) ON DELETE CASCADE,
+                    PRIMARY KEY (adjunto_id, heroina_id)
+                )
+            """)
+        if migrar_voces:
+            conn.execute("""
+                INSERT INTO voces_personajes(adjunto_id, heroina_id)
+                SELECT v.id, h.id FROM voces v JOIN heroinas h
+                ON h.id=v.heroina_id AND h.juego_id=v.juego_id
+            """)
     return conn
 
 
@@ -14979,8 +15000,9 @@ class ReproductorOpening(QWidget):
     empezo = Signal()                  # empezó a sonar (para pausar la música)
     indice_cambiado = Signal(int)      # qué opening de la lista está activo
 
-    def __init__(self, volumen=OPENING_VOLUMEN):
+    def __init__(self, volumen=OPENING_VOLUMEN, *, secuencia=True):
         super().__init__()
+        self._secuencia = secuencia
         self._rutas, self._titulos, self._idx, self._fallos = [], [], 0, 0
         self._vol_previo = 0
         self._silenciando = False
@@ -15330,7 +15352,7 @@ class ReproductorOpening(QWidget):
 
     def _etiquetar(self):
         n = len(self._rutas)
-        varios = n > 1
+        varios = self._secuencia and n > 1
         self.b_ant.setVisible(varios)
         self.b_sig.setVisible(varios)
         self.lbl_n.setVisible(varios)
@@ -15401,7 +15423,7 @@ class ReproductorOpening(QWidget):
             self.player.play()
 
     def saltar(self, d, manual=False):
-        if not self._rutas:
+        if not self._secuencia or not self._rutas:
             return
         if len(self._rutas) == 1:
             if self.player.source().isEmpty():
@@ -15426,7 +15448,8 @@ class ReproductorOpening(QWidget):
         if self.sonando():
             self.player.pause()
         elif self.player.source().isEmpty():
-            self._abrir(self._idx, True)
+            if self._secuencia:
+                self._abrir(self._idx, True)
         else:
             self.player.play()
 
@@ -15466,7 +15489,7 @@ class ReproductorOpening(QWidget):
 
     # ---- eventos del motor
     def _al_status(self, status):
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+        if self._secuencia and status == QMediaPlayer.MediaStatus.EndOfMedia:
             QTimer.singleShot(0, self._fin_de_video)
 
     def _fin_de_video(self):
@@ -15488,11 +15511,51 @@ class ReproductorOpening(QWidget):
 
     def _al_error(self, *_):
         self._fallos += 1                             # un video roto se salta, sin bucles infinitos
-        if len(self._rutas) > 1 and self._fallos < len(self._rutas):
+        if self._secuencia and len(self._rutas) > 1 and self._fallos < len(self._rutas):
             QTimer.singleShot(0, lambda: self.saltar(1))
         else:
             self.reposo.setText("⚠ No se pudo reproducir este video")
             self.pantalla.setCurrentIndex(0)
+
+
+class DelegadoTarjetaVoz(QStyledItemDelegate):
+    def sizeHint(self, opcion, indice):
+        return QSize(226, 192)
+
+    def paint(self, p, opcion, indice):
+        p.save()
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = QRectF(opcion.rect).adjusted(3, 3, -3, -3)
+            acento = QColor(Tema.a1())
+            fondo = QColor(Tema.c("input"))
+            seleccionado = bool(opcion.state & QStyle.StateFlag.State_Selected)
+            p.setBrush(mezclar(fondo, acento, .13) if seleccionado else fondo)
+            p.setPen(QPen(acento if seleccionado else QColor(Tema.c("border")), 1))
+            p.drawRoundedRect(r, 14, 14)
+
+            icono = indice.data(Qt.ItemDataRole.DecorationRole)
+            if isinstance(icono, QIcon):
+                imagen = icono.pixmap(QSize(202, 128), QIcon.Mode.Normal)
+                p.drawPixmap(QPointF(r.center().x() - imagen.width() / 2,
+                                     r.top() + 8 + (128 - imagen.height()) / 2), imagen)
+
+            texto = indice.data(Qt.ItemDataRole.DisplayRole) or ""
+            titulo, _, nombres = texto.partition("\n")
+            fuente = QFont(opcion.font)
+            fuente.setBold(True)
+            p.setFont(fuente)
+            ancho = int(r.width() - 16)
+            p.setPen(QColor(Tema.c("text")))
+            p.drawText(QRectF(r.x() + 8, r.y() + 139, ancho, 19), Qt.AlignmentFlag.AlignCenter,
+                       p.fontMetrics().elidedText(titulo, Qt.TextElideMode.ElideRight, ancho))
+            fuente.setBold(False)
+            p.setFont(fuente)
+            p.setPen(mezclar(QColor(Tema.c("text")), fondo, .23))
+            p.drawText(QRectF(r.x() + 8, r.y() + 161, ancho, 18), Qt.AlignmentFlag.AlignCenter,
+                       p.fontMetrics().elidedText(nombres, Qt.TextElideMode.ElideRight, ancho))
+        finally:
+            p.restore()
 
 
 class DelegadoCatalogoOpening(QStyledItemDelegate):
@@ -17990,14 +18053,14 @@ class NyuhuhuGallery(QMainWindow):
     # PESTAÑA «OPENINGS» DE LA NOVELA
     # -----------------------------------------------------
 
-    def _nuevo_reproductor_opening(self):
+    def _nuevo_reproductor_opening(self, *, secuencia=True):
         try:
             f = self.conn.execute(
                 "SELECT valor FROM ajustes WHERE clave = 'opening_volumen'").fetchone()
             vol = int(f[0]) if f else OPENING_VOLUMEN
         except (sqlite3.Error, ValueError):
             vol = OPENING_VOLUMEN
-        rp = ReproductorOpening(vol)
+        rp = ReproductorOpening(vol, secuencia=secuencia)
         rp.volumen_cambiado.connect(self._guardar_volumen_opening)
         rp.empezo.connect(lambda r=rp: self._opening_empezo(r))
         return rp
@@ -18090,17 +18153,29 @@ class NyuhuhuGallery(QMainWindow):
 
         panel = QFrame()
         panel.setObjectName("panel")
-        panel.setMinimumWidth(235)
-        panel.setMaximumWidth(360)
+        panel.setMinimumWidth(295)
+        panel.setMaximumWidth(390)
         lado = QVBoxLayout(panel)
         titulo = QLabel("Clips de la novela")
         titulo.setObjectName("heading")
         lado.addWidget(titulo)
+        self._miniaturas_clips = OrderedDict()
+        self._cola_miniaturas_clips = []
+        self._proceso_miniatura_clip = None
         self.lista_clips = QListWidget()
+        self.lista_clips.setIconSize(QSize(94, 53))
         self.lista_clips.setUniformItemSizes(True)
         self.lista_clips.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.lista_clips.itemActivated.connect(self.reproducir_clip)
-        lado.addWidget(self.lista_clips, 1)
+        self.lista_clips.itemClicked.connect(self.reproducir_clip)
+        lado.addWidget(self.lista_clips, 2)
+        lado.addWidget(QLabel("Personajes en el clip"))
+        self.personajes_clip = QScrollArea()
+        self.personajes_clip.setWidgetResizable(True)
+        self.personajes_clip.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.personajes_clip.setFixedHeight(151)
+        self.personajes_clip.setFrameShape(QFrame.Shape.NoFrame)
+        lado.addWidget(self.personajes_clip)
+        self.lista_clips.currentItemChanged.connect(self._mostrar_personajes_clip)
 
         acciones = QHBoxLayout()
         ver = BotonAnimado("▶ Reproducir", primario=True)
@@ -18113,6 +18188,10 @@ class NyuhuhuGallery(QMainWindow):
         renombrar = BotonAnimado("✎ Renombrar archivo")
         renombrar.clicked.connect(lambda: self._renombrar_adjunto("clips"))
         lado.addWidget(renombrar)
+        editar = BotonAnimado("Editar personajes")
+        editar.clicked.connect(lambda: self._editar_adjuntos_personajes("clips"))
+        lado.addWidget(editar)
+        lado.addWidget(self._boton_ubicacion_adjunto(self.lista_clips))
         cuerpo.addWidget(panel)
         return vista
 
@@ -18120,30 +18199,143 @@ class NyuhuhuGallery(QMainWindow):
         if self.juego_id is None:
             return
         if self.clips_reproductor is None:
-            self.clips_reproductor = self._nuevo_reproductor_opening()
+            self.clips_reproductor = self._nuevo_reproductor_opening(secuencia=False)
             reproductor = self.clips_reproductor
             reproductor.reposo.clic.disconnect(reproductor.alternar_play)
             reproductor.reposo.clic.connect(
                 lambda: self.reproducir_clip(self.lista_clips.currentItem()))
+            reproductor.player.sourceChanged.connect(self._sincronizar_personajes_clip)
             self.escenario_clips.addWidget(reproductor, 1)
             self.escenario_clips.addWidget(self._boton_cerrar_video(reproductor))
         registros = self.conn.execute(
             "SELECT id, titulo, ruta FROM clips WHERE juego_id=? ORDER BY id", (self.juego_id,)
         ).fetchall()
         self.lista_clips.clear()
+        self._cola_miniaturas_clips.clear()
         for id_clip, titulo, ruta in registros:
             item = QListWidgetItem(titulo)
+            item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+            try:
+                info = Path(ruta).stat()
+                clave = (ruta, info.st_size, info.st_mtime_ns)
+                item.setData(Qt.ItemDataRole.UserRole + 2, clave)
+                if clave in self._miniaturas_clips:
+                    icono = self._miniaturas_clips[clave]
+                    if not icono.isNull():
+                        item.setIcon(icono)
+                else:
+                    self._cola_miniaturas_clips.append(clave)
+            except OSError:
+                pass
             item.setData(Qt.ItemDataRole.UserRole, ruta)
             item.setData(Qt.ItemDataRole.UserRole + 1, id_clip)
             item.setToolTip(Path(ruta).name)
-            item.setSizeHint(QSize(0, 38))
+            item.setSizeHint(QSize(0, 65))
             self.lista_clips.addItem(item)
         if registros:
             fila = next((i for i, r in enumerate(registros) if r[0] == seleccion), 0)
             self.lista_clips.setCurrentRow(fila)
         self.clips_reproductor.cargar([r[2] for r in registros], titulos=[r[1] for r in registros])
+        self._mostrar_personajes_clip(self.lista_clips.currentItem())
+        self._siguiente_miniatura_clip()
         if not registros:
             self.clips_reproductor.reposo.setText("Adjunta un clip para empezar")
+
+    def _siguiente_miniatura_clip(self):
+        if (self._proceso_miniatura_clip is not None or
+                not self._cola_miniaturas_clips or not self._ffmpeg):
+            return
+        clave = self._cola_miniaturas_clips.pop(0)
+        if clave in self._miniaturas_clips:
+            QTimer.singleShot(0, self._siguiente_miniatura_clip)
+            return
+        proceso = QProcess(self)
+        self._proceso_miniatura_clip = proceso
+        proceso.setStandardErrorFile(QProcess.nullDevice())
+        limite = QTimer(proceso)
+        limite.setSingleShot(True)
+        limite.timeout.connect(proceso.kill)
+
+        def completar(correcto):
+            if self._proceso_miniatura_clip is not proceso:
+                return
+            limite.stop()
+            self._proceso_miniatura_clip = None
+            imagen = QPixmap()
+            if correcto:
+                imagen.loadFromData(bytes(proceso.readAllStandardOutput()), "PNG")
+            icono = QIcon(imagen) if not imagen.isNull() else QIcon()
+            self._miniaturas_clips[clave] = icono
+            if len(self._miniaturas_clips) > 240:
+                self._miniaturas_clips.popitem(last=False)
+            if not icono.isNull():
+                for i in range(self.lista_clips.count()):
+                    item = self.lista_clips.item(i)
+                    datos = item.data(Qt.ItemDataRole.UserRole + 2)
+                    if datos is not None and tuple(datos) == clave:
+                        item.setIcon(icono)
+            proceso.deleteLater()
+            QTimer.singleShot(0, self._siguiente_miniatura_clip)
+
+        proceso.finished.connect(lambda codigo, estado: completar(
+            codigo == 0 and estado == QProcess.ExitStatus.NormalExit))
+        proceso.errorOccurred.connect(lambda error: completar(False)
+            if error == QProcess.ProcessError.FailedToStart else None)
+        limite.start(10000)
+        proceso.start(str(self._ffmpeg), [
+            "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "1",
+            "-i", clave[0], "-map", "0:v:0", "-frames:v", "1",
+            "-vf", "scale=94:53:force_original_aspect_ratio=decrease,pad=94:53:(ow-iw)/2:(oh-ih)/2",
+            "-c:v", "png", "-threads", "1", "-f", "image2pipe", "pipe:1"
+        ])
+
+    def _mostrar_personajes_clip(self, item, _anterior=None):
+        contenido = QWidget()
+        fila = QHBoxLayout(contenido)
+        fila.setContentsMargins(4, 3, 4, 3)
+        fila.setSpacing(8)
+        fila.addStretch(1)
+        vid = item.data(Qt.ItemDataRole.UserRole + 1) if item is not None else None
+        personas = self._personajes_de_adjunto("clips", vid) if vid is not None else []
+        for hid, nombre, foto, enc in personas:
+            tarjeta = QWidget()
+            tarjeta.setFixedWidth(128)
+            columna = QVBoxLayout(tarjeta)
+            columna.setContentsMargins(2, 0, 2, 0)
+            columna.setSpacing(2)
+            columna.setAlignment(Qt.AlignmentFlag.AlignTop)
+            imagen = QLabel()
+            imagen.setFixedHeight(105)
+            imagen.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            retrato = (self._retrato_incognito(105) if hid == 0 else
+                       CACHE_GRANDE.obtener(foto, 150) if foto else QPixmap())
+            if retrato.isNull():
+                retrato = avatar("", 105, parse_enc(enc))
+            imagen.setPixmap(retrato.scaled(QSize(108, 105), Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.SmoothTransformation))
+            columna.addWidget(imagen)
+            etiqueta = QLabel(nombre)
+            etiqueta.setWordWrap(True)
+            etiqueta.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            etiqueta.setToolTip(nombre)
+            columna.addWidget(etiqueta)
+            fila.addWidget(tarjeta)
+        if not personas:
+            texto = QLabel("Sin personajes asignados" if item is not None else "Selecciona un clip")
+            texto.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            fila.addWidget(texto)
+        fila.addStretch(1)
+        self.personajes_clip.setWidget(contenido)
+
+    def _sincronizar_personajes_clip(self, url):
+        if url.isEmpty():
+            return
+        ruta = os.path.normcase(os.path.normpath(url.toLocalFile()))
+        for i in range(self.lista_clips.count()):
+            item = self.lista_clips.item(i)
+            if os.path.normcase(os.path.normpath(item.data(Qt.ItemDataRole.UserRole))) == ruta:
+                self.lista_clips.setCurrentItem(item)
+                return
 
     def reproducir_clip(self, item):
         if item is None or self.clips_reproductor is None:
@@ -18172,20 +18364,32 @@ class NyuhuhuGallery(QMainWindow):
             return
         jid = self.juego_id
         cantidad = 0
+        personajes = self._personajes_disponibles()
         for archivo in archivos:
             origen = Path(archivo)
-            destino = nombre_disponible(carpeta, origen.name)
-            if not self._copiar_con_progreso(archivo, destino, "Adjuntando clip"):
+            elegidas = self._elegir_personajes_adjunto(personajes, origen.name)
+            if elegidas is None or jid != self.juego_id:
                 break
-            with self.conn:
-                self.conn.execute("INSERT INTO clips(juego_id,titulo,ruta) VALUES (?,?,?)",
-                                  (jid, origen.stem, str(destino)))
+            destino = nombre_disponible(carpeta, origen.name)
+            try:
+                if not self._copiar_con_progreso(archivo, destino, "Adjuntando clip"):
+                    break
+                with self.conn:
+                    cursor = self.conn.execute(
+                        "INSERT INTO clips(juego_id,titulo,ruta) VALUES (?,?,?)",
+                        (jid, destino.stem, str(destino)))
+                    self._guardar_personajes_adjunto("clips", cursor.lastrowid, jid, elegidas)
+            except (OSError, sqlite3.Error):
+                destino.unlink(missing_ok=True)
+                self.toast("No se pudo adjuntar el clip.")
+                break
             cantidad += 1
         if cantidad:
             self.cargar_clips()
             self.toast(f"{cantidad} {'clip adjuntado' if cantidad == 1 else 'clips adjuntados'}.")
 
     def _detener_clips(self):
+        self._cola_miniaturas_clips.clear()
         if self.clips_reproductor is not None:
             self.clips_reproductor.detener()
 
@@ -18207,10 +18411,19 @@ class NyuhuhuGallery(QMainWindow):
         renombrar = BotonAnimado("✎ Renombrar archivo")
         renombrar.clicked.connect(lambda: self._renombrar_adjunto("voces"))
         cabecera.addWidget(renombrar)
-        contenido.addLayout(cabecera)
+        editar = BotonAnimado("Editar personajes")
+        editar.clicked.connect(lambda: self._editar_adjuntos_personajes("voces"))
+        cabecera.addWidget(editar)
+        quitar = BotonAnimado("Eliminar audio")
+        quitar.clicked.connect(self._eliminar_voz)
+        cabecera.addWidget(quitar)
 
         self.lista_voces = QListWidget()
+        cabecera.addWidget(self._boton_ubicacion_adjunto(self.lista_voces))
+        contenido.addLayout(cabecera)
         self._configurar_tarjetas_voces(self.lista_voces)
+        self.lista_voces.setGridSize(QSize(226, 192))
+        self.lista_voces.setItemDelegate(DelegadoTarjetaVoz(self.lista_voces))
         self.lista_voces.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.lista_voces.itemActivated.connect(self.reproducir_voz)
         contenido.addWidget(self.lista_voces, 1)
@@ -18261,12 +18474,81 @@ class NyuhuhuGallery(QMainWindow):
     def _icono_voz(foto, encuadre):
         return QIcon(avatar(foto or "", 164, parse_enc(encuadre)))
 
-    def _elegir_heroina_voz(self, heroinas, archivo):
+    def _personajes_disponibles(self):
+        return self.conn.execute("""
+            SELECT id, nombre, foto, foto_enc FROM heroinas
+            WHERE juego_id=? AND nombre <> 'General'
+            ORDER BY orden, nombre
+        """, (self.juego_id,)).fetchall()
+
+    @staticmethod
+    def _retrato_incognito(lado):
+        imagen = QPixmap(lado, lado)
+        imagen.fill(Qt.GlobalColor.transparent)
+        pintor = QPainter(imagen)
+        pintor.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pintor.setBrush(QColor(Tema.c("input")))
+        pintor.setPen(QPen(QColor(Tema.a1()), 1.5))
+        pintor.drawEllipse(QRectF(2, 2, lado - 4, lado - 4))
+        fuente = QFont()
+        fuente.setPixelSize(max(10, lado // 2))
+        fuente.setBold(True)
+        pintor.setFont(fuente)
+        pintor.setPen(QColor(Tema.c("text")))
+        pintor.drawText(imagen.rect(), Qt.AlignmentFlag.AlignCenter, "?")
+        pintor.end()
+        return imagen
+
+    def _personajes_de_adjunto(self, tabla, vid):
+        personajes = self.conn.execute(f"""
+            SELECT h.id,h.nombre,h.foto,h.foto_enc
+            FROM {tabla}_personajes p JOIN heroinas h ON h.id=p.heroina_id
+            JOIN {tabla} a ON a.id=p.adjunto_id AND a.juego_id=h.juego_id
+            WHERE a.id=? AND a.juego_id=? ORDER BY h.orden,h.nombre,h.id
+        """, (vid,self.juego_id)).fetchall()
+        fila = self.conn.execute(
+            f"SELECT incognito FROM {tabla} WHERE id=? AND juego_id=?", (vid,self.juego_id)
+        ).fetchone()
+        if fila and fila[0]:
+            personajes.append((0, "Incógnito", None, None))
+        return personajes
+
+    def _guardar_personajes_adjunto(self, tabla, vid, jid, elegidas):
+        self.conn.execute(f"UPDATE {tabla} SET incognito=? WHERE id=? AND juego_id=?",
+                          (int(0 in elegidas),vid,jid))
+        self.conn.execute(f"DELETE FROM {tabla}_personajes WHERE adjunto_id=?", (vid,))
+        self.conn.executemany(f"""
+            INSERT INTO {tabla}_personajes(adjunto_id,heroina_id)
+            SELECT ?,id FROM heroinas WHERE id=? AND juego_id=?
+        """, [(vid,hid,jid) for hid in dict.fromkeys(elegidas) if hid != 0])
+
+    def _editar_adjuntos_personajes(self, tabla):
+        lista = self.lista_clips if tabla == "clips" else self.lista_voces
+        item = lista.currentItem()
+        if item is None:
+            self.toast("Selecciona un archivo.")
+            return
+        vid = item.data(Qt.ItemDataRole.UserRole + 1)
+        jid = self.juego_id
+        previas = [f[0] for f in self._personajes_de_adjunto(tabla, vid)]
+        elegidas = self._elegir_personajes_adjunto(
+            self._personajes_disponibles(), Path(item.data(Qt.ItemDataRole.UserRole)).name, previas)
+        if elegidas is None or self.juego_id != jid:
+            return
+        with self.conn:
+            self._guardar_personajes_adjunto(tabla, vid, jid, elegidas)
+        if tabla == "clips":
+            self._mostrar_personajes_clip(item)
+        else:
+            self.cargar_voces(vid)
+        self.toast("Personajes actualizados.")
+
+    def _elegir_personajes_adjunto(self, heroinas, archivo, previas=(), requeridas=False):
         dialogo = QDialog(self)
-        dialogo.setWindowTitle("Asignar audio a una heroína")
+        dialogo.setWindowTitle("Asignar personajes")
         dialogo.resize(930, 640)
         contenido = QVBoxLayout(dialogo)
-        texto = QLabel(f"¿De quién es «{archivo}»?")
+        texto = QLabel(f"Haz clic en las tarjetas para elegir los personajes de «{archivo}».")
         texto.setWordWrap(True)
         contenido.addWidget(texto)
         buscar = QLineEdit()
@@ -18274,12 +18556,15 @@ class NyuhuhuGallery(QMainWindow):
         contenido.addWidget(buscar)
         lista = QListWidget()
         self._configurar_tarjetas_voces(lista)
+        lista.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         contenido.addWidget(lista, 1)
-        for hid, nombre, foto, encuadre in heroinas:
-            item = QListWidgetItem(self._icono_voz(foto, encuadre), nombre)
+        for hid, nombre, foto, encuadre in [(0,"Incógnito",None,None), *heroinas]:
+            icono = QIcon(self._retrato_incognito(164)) if hid == 0 else self._icono_voz(foto, encuadre)
+            item = QListWidgetItem(icono, nombre)
             item.setData(Qt.ItemDataRole.UserRole, hid)
-            item.setToolTip(nombre)
+            item.setToolTip("Personaje que no aparece en la lista" if hid == 0 else nombre)
             lista.addItem(item)
+            item.setSelected(hid in previas)
         def filtrar(texto):
             aguja = texto.strip().casefold()
             for i in range(lista.count()):
@@ -18288,71 +18573,149 @@ class NyuhuhuGallery(QMainWindow):
             actual = lista.currentItem()
             if actual is None or actual.isHidden():
                 lista.setCurrentItem(next((lista.item(i) for i in range(lista.count())
-                                           if not lista.item(i).isHidden()), None))
+                                           if not lista.item(i).isHidden()), None),
+                                     QItemSelectionModel.SelectionFlag.NoUpdate)
         buscar.textChanged.connect(filtrar)
         acciones = QHBoxLayout()
         acciones.addStretch(1)
         cancelar = BotonAnimado("Cancelar")
         cancelar.clicked.connect(dialogo.reject)
-        elegir = BotonAnimado("Asignar audio", primario=True)
-        def aceptar():
-            if lista.currentItem() is not None and not lista.currentItem().isHidden():
+        elegir = BotonAnimado("Guardar selección", primario=True)
+        def seleccion():
+            return [lista.item(i).data(Qt.ItemDataRole.UserRole) for i in range(lista.count())
+                    if lista.item(i).isSelected()]
+        def confirmar():
+            if not requeridas or seleccion():
                 dialogo.accept()
-        elegir.clicked.connect(aceptar)
-        lista.itemActivated.connect(aceptar)
+        def refrescar():
+            n = len(seleccion())
+            elegir.setText(f"Guardar selección ({n})")
+            elegir.setEnabled(n > 0 or not requeridas)
+        elegir.clicked.connect(confirmar)
+        lista.itemSelectionChanged.connect(refrescar)
+        refrescar()
         acciones.addWidget(cancelar)
         acciones.addWidget(elegir)
         contenido.addLayout(acciones)
-        lista.setCurrentRow(0)
+        lista.setCurrentRow(0, QItemSelectionModel.SelectionFlag.NoUpdate)
         buscar.setFocus()
-        return (lista.currentItem().data(Qt.ItemDataRole.UserRole)
-                if dialogo.exec() == QDialog.DialogCode.Accepted else None)
+        return seleccion() if dialogo.exec() == QDialog.DialogCode.Accepted else None
 
     def cargar_voces(self, seleccion=None):
         if self.juego_id is None:
             return
-        filas = self.conn.execute("""
-            SELECT v.id, v.titulo, v.ruta, h.nombre, h.foto, h.foto_enc
-            FROM voces v LEFT JOIN heroinas h ON h.id = v.heroina_id
-            WHERE v.juego_id = ? ORDER BY h.orden, h.nombre COLLATE NOCASE, v.id
-        """, (self.juego_id,)).fetchall()
+        filas = self.conn.execute(
+            "SELECT id,titulo,ruta FROM voces WHERE juego_id=? ORDER BY id",
+            (self.juego_id,)).fetchall()
+        desaparecidas = []
         self.lista_voces.clear()
         indice = 0
-        for i, (vid, titulo, ruta, heroina, foto, encuadre) in enumerate(filas):
-            nombre = heroina or "Heroína eliminada"
-            item = QListWidgetItem(self._icono_voz(foto, encuadre), f"{titulo}\n{nombre}")
+        carpeta = (ROOT / self.juego_carpeta / "Voces").resolve()
+        for vid, titulo, ruta in filas:
+            archivo = Path(ruta)
+            if (carpeta.is_relative_to(ROOT.resolve()) and carpeta.parent.is_dir()
+                    and archivo.parent.resolve() == carpeta):
+                try:
+                    archivo.stat()
+                except FileNotFoundError:
+                    desaparecidas.append((vid,self.juego_id))
+                    continue
+                except OSError:
+                    pass
+            personas = self._personajes_de_adjunto("voces", vid)
+            nombres = " · ".join(f[1] for f in personas) or "Sin personajes asignados"
+            item = QListWidgetItem(self._icono_voces_grupo(personas), f"{titulo}\n{nombres}")
             item.setData(Qt.ItemDataRole.UserRole, ruta)
             item.setData(Qt.ItemDataRole.UserRole + 1, vid)
-            item.setToolTip(f"{Path(ruta).name}\n{nombre}")
-            self.lista_voces.addItem(item)
+            item.setToolTip(f"{archivo.name}\n{nombres}")
             if vid == seleccion:
-                indice = i
-        if filas:
+                indice = self.lista_voces.count()
+            self.lista_voces.addItem(item)
+        if desaparecidas:
+            with self.conn:
+                self.conn.executemany("DELETE FROM voces WHERE id=? AND juego_id=?", desaparecidas)
+        if self.lista_voces.count():
             self.lista_voces.setCurrentRow(indice)
-        self.estado_voces.setText("" if filas else "Adjunta un audio y selecciona a su heroína.")
+        self.estado_voces.setText("" if self.lista_voces.count() else "Adjunta un audio y asigna sus personajes.")
+
+    def _icono_voces_grupo(self, personas):
+        if len(personas) < 2:
+            hid, _, foto, encuadre = personas[0] if personas else (None,None,None,None)
+            return QIcon(self._retrato_incognito(124) if hid == 0 else
+                         avatar(foto or "", 124, parse_enc(encuadre)))
+        ancho, alto, espacio = 202, 128, 8
+        dibujo = QPixmap(ancho, alto)
+        dibujo.fill(Qt.GlobalColor.transparent)
+        pintor = QPainter(dibujo)
+        pintor.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        cols = max(2, ceil((len(personas) * ancho / alto) ** .5))
+        filas = ceil(len(personas) / cols)
+        lado = min((ancho - espacio*(cols - 1)) // cols,
+                   (alto - espacio*(filas - 1)) // filas)
+        for i, (hid, _, foto, encuadre) in enumerate(personas):
+            fila, col = divmod(i, cols)
+            en_fila = min(cols, len(personas) - fila*cols)
+            x = (ancho - en_fila*lado - (en_fila - 1)*espacio) // 2
+            y = (alto - filas*lado - (filas - 1)*espacio) // 2
+            retrato = self._retrato_incognito(lado) if hid == 0 else avatar(foto or "", lado, parse_enc(encuadre))
+            pintor.drawPixmap(x + col*(lado + espacio), y + fila*(lado + espacio), retrato)
+        pintor.end()
+        return QIcon(dibujo)
+
+    def _eliminar_voz(self):
+        item = self.lista_voces.currentItem()
+        if item is None:
+            self.toast("Selecciona el audio que quieres eliminar.")
+            return
+        vid = item.data(Qt.ItemDataRole.UserRole + 1)
+        jid = self.juego_id
+        ruta = Path(item.data(Qt.ItemDataRole.UserRole))
+        carpeta = (ROOT / self.juego_carpeta / "Voces").resolve()
+        if QMessageBox.question(self, "Eliminar audio",
+                f"¿Quitar «{ruta.name}» de Voces? El archivo se moverá a la carpeta Papelera de voces.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        if not carpeta.is_relative_to(ROOT.resolve()) or ruta.parent.resolve() != carpeta:
+            self.toast("El archivo no está en la carpeta de voces de esta novela.")
+            return
+        if self.voces_player and self.voces_player.source() == QUrl.fromLocalFile(str(ruta)):
+            self._detener_voces()
+        destino = None
+        try:
+            if ruta.is_file():
+                papelera = (carpeta.parent / "Papelera de voces").resolve()
+                if papelera.parent != carpeta.parent:
+                    raise OSError("Carpeta de recuperación no válida")
+                papelera.mkdir(exist_ok=True)
+                candidata = nombre_disponible(papelera,ruta.name)
+                ruta.rename(candidata)
+                destino = candidata
+            with self.conn:
+                self.conn.execute("DELETE FROM voces WHERE id=? AND juego_id=?", (vid,jid))
+        except (OSError,sqlite3.Error):
+            if destino is not None:
+                destino.rename(ruta)
+            self.toast("No se pudo eliminar el audio.")
+            return
+        self.cargar_voces()
+        self.toast("Audio eliminado de Voces.")
 
     def adjuntar_voz(self):
         jid = self.juego_id
         if jid is None:
             return
-        heroinas = self.conn.execute("""
-            SELECT id, nombre, foto, foto_enc FROM heroinas
-            WHERE juego_id = ? AND nombre <> 'General'
-            ORDER BY orden, nombre
-        """, (jid,)).fetchall()
-        if not heroinas:
-            self.toast("Añade una heroína a la novela antes de adjuntar voces.")
-            return
+        heroinas = self._personajes_disponibles()
         archivo, _ = QFileDialog.getOpenFileName(
-            self, "Adjuntar audio de una heroína", str(ROOT), f"Audio ({EXT_AUDIO} *.aac *.opus)")
+            self, "Adjuntar audio a la novela", str(ROOT), f"Audio ({EXT_AUDIO} *.aac *.opus)")
         if not archivo or jid != self.juego_id:
             return
         origen = Path(archivo)
         if origen.suffix.lower() not in {pat[1:] for pat in (EXT_AUDIO + " *.aac *.opus").split()}:
             self.toast("Selecciona un archivo de audio compatible.")
             return
-        elegida = self._elegir_heroina_voz(heroinas, origen.name)
-        if elegida is None or jid != self.juego_id:
+        elegidas = self._elegir_personajes_adjunto(heroinas, origen.name, requeridas=True)
+        if elegidas is None or jid != self.juego_id:
             return
         carpeta = (ROOT / self.juego_carpeta / "Voces").resolve()
         if not carpeta.is_relative_to(ROOT.resolve()):
@@ -18368,8 +18731,9 @@ class NyuhuhuGallery(QMainWindow):
                 return
             with self.conn:
                 cursor = self.conn.execute(
-                    "INSERT INTO voces(juego_id, heroina_id, titulo, ruta) VALUES (?,?,?,?)",
-                    (jid, elegida, destino.stem, str(destino)))
+                    "INSERT INTO voces(juego_id, titulo, ruta) VALUES (?,?,?)",
+                    (jid, destino.stem, str(destino)))
+                self._guardar_personajes_adjunto("voces", cursor.lastrowid, jid, elegidas)
         except (OSError, sqlite3.Error):
             if copiado:
                 destino.unlink(missing_ok=True)
@@ -18436,6 +18800,20 @@ class NyuhuhuGallery(QMainWindow):
             self.voces_player.stop()
             self.voces_player.setSource(QUrl())
             self.estado_voces.clear()
+
+    def _boton_ubicacion_adjunto(self, lista):
+        boton = BotonAnimado("Abrir ubicación del archivo")
+        boton.clicked.connect(lambda: self._abrir_ubicacion_adjunto(lista))
+        return boton
+
+    def _abrir_ubicacion_adjunto(self, lista):
+        item = lista.currentItem()
+        if item is None:
+            self.toast("Selecciona un archivo.")
+            return
+        carpeta = Path(item.data(Qt.ItemDataRole.UserRole)).parent
+        if not carpeta.is_dir() or not QDesktopServices.openUrl(QUrl.fromLocalFile(str(carpeta))):
+            self.toast("No se pudo abrir la carpeta del archivo.")
 
     def _renombrar_adjunto(self, tabla):
         es_clip = tabla == "clips"

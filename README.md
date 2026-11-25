@@ -1,6 +1,6 @@
 # Nyuhuhu Gallery
 
-**[Descargar Nyuhuhu Gallery 5.1.0 para Windows](https://github.com/PaytonN131/nyuhuhu-gallery/releases/download/v5.1.0/NyuhuhuGallery-Windows.zip)** · [Ver todas las versiones](https://github.com/PaytonN131/nyuhuhu-gallery/releases)
+**[Descargar Nyuhuhu Gallery 5.1.1 para Windows](https://github.com/PaytonN131/nyuhuhu-gallery/releases/download/v5.1.1/NyuhuhuGallery-5.1.1-Windows.zip)** · [Ver todas las versiones](https://github.com/PaytonN131/nyuhuhu-gallery/releases)
 
 Nyuhuhu Gallery es una aplicación de escritorio para organizar una colección de novelas visuales. Reúne portadas, capturas, fichas de personajes, música, clips y voces en una biblioteca local.
 
@@ -8,8 +8,8 @@ Nyuhuhu Gallery es una aplicación de escritorio para organizar una colección d
 
 - Biblioteca con búsqueda, favoritos, clasificación y temas personalizables.
 - **Ficha y guía** con datos de lanzamiento, desarrolladora, enlace a VNDB y un visor integrado para adjuntar y leer tus PDF en una o dos páginas.
-- **Openings y Clips** con reproducción de video. Los clips admiten renombrado desde la aplicación.
-- **Voces** con tarjetas de retrato, selección de heroína por nombre o foto, reproducción y renombrado de audios.
+- **Openings y Clips** con reproducción de video. Los clips tienen miniaturas, reproducen el video seleccionado una vez y muestran los personajes asociados junto al reproductor.
+- **Voces** con tarjetas de retrato, reproducción y gestión de archivos. Tanto en Voces como en Clips puedes asignar varios personajes con un clic por tarjeta, usar Incógnito y abrir la carpeta del archivo.
 - Reproductor de música con equilibrio automático de sonoridad de los MP3 mediante FFmpeg.
 
 ## Cómo empezar
